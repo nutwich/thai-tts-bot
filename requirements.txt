@@ -1,0 +1,6 @@
+discord.py[voice]>=2.7.1
+edge-tts>=7.0
+imageio-ffmpeg>=0.5
+python-dotenv>=1.0
+gTTS>=2.5
+davey==0.1.7
