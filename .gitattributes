@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Linux scripts must keep LF or bash breaks; Windows scripts keep CRLF
+*.sh text eol=lf
+*.bat text eol=crlf

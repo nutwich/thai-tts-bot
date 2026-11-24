@@ -28,6 +28,9 @@ Hard requirement: **100% free**. No paid APIs, no paid hosting, no API keys apar
 - `bot.py`: the whole bot (single file).
 - `requirements.txt`: dependencies.
 - `start.bat`: one-click launcher. It finds Python or installs it via `winget install Python.Python.3.12 --scope user`, creates `.venv`, runs `pip install -r requirements.txt` on every start, creates `.env` from `.env.example` and opens it in Notepad if it is missing, then runs `bot.py`.
+- `setup.sh`: Linux (Ubuntu/Debian) setup/update. Installs `python3-venv` + `libopus0` (discord.py does not bundle opus on Linux), creates `.venv`, installs requirements, creates `.env` (chmod 600), and installs a systemd service `thai-tts-bot` (restart on crash, start on boot). Re-run after `git pull` to update. Must stay LF (`.gitattributes`).
+- `Dockerfile` / `.dockerignore` / `render.yaml`: free Render hosting (Docker, `plan: free`, Singapore). Token is a Render dashboard secret (`sync: false`), never in git.
+- `CLOUD_SETUP.md`: Thai step-by-step guide: Render + cron-job.org ping (primary), Linux VM via `setup.sh` (fallback). The owner could not sign up for Oracle Cloud, so Oracle is not an option.
 - `.env.example`: config template.
 - `.env`: **contains the bot token. Never commit, share or paste it anywhere.**
 
@@ -39,6 +42,9 @@ TTS_RATE=+50%           # edge-tts rate; +50% = 1.5x (ffmpeg fallback follows th
 TTS_PITCH=+15Hz         # edge-tts pitch; slightly higher
 READ_NAME=false         # true = prefix "<display name>:" before each message
 MAX_CHARS=300           # truncate long messages ("และอื่นๆ")
+AUTO_JOIN=true          # someone in voice types in that voice channel's chat -> bot joins
+READ_CHANNEL_ID=        # optional extra text channel that can also summon the bot
+PORT=                   # set by Render: starts an aiohttp /health endpoint for cron pings
 ```
 
 ## Behaviour
@@ -60,6 +66,13 @@ MAX_CHARS=300           # truncate long messages ("และอื่นๆ")
   - text is truncated at `MAX_CHARS`
 - Each server has its own `asyncio.Queue` (maxsize 20, excess dropped to avoid lag) and its own player task. Each clip is a temp MP3, played through `FFmpegPCMAudio`, then deleted (no message or audio retention).
 - Auto-disconnect when only bots remain in the voice channel.
+- **Auto-join** (`AUTO_JOIN`, in `on_message` → `auto_join_from_message`). This is what the owner means by "auto join"; it does *not* join on voice-channel entry or on startup.
+  - Trigger: the bot is not in voice in that server, and a human who is in a voice channel types in that voice channel's built-in chat. `READ_CHANNEL_ID` or the last `/join` text channel also count. The AFK channel is ignored.
+  - Effect: the bot joins the typer's voice channel, binds the channel the message was typed in, and reads that message too.
+  - The bot never moves if it is already in another channel.
+  - `/leave` pauses auto-join for that server until no humans are in any voice channel, or until `/join`.
+  - `/join` and auto-join share `_connect()` behind a per-guild `asyncio.Lock`, so simultaneous messages connect once.
+- On Linux, `_check_opus()` loads `libopus.so.0` (warns if missing), and ffmpeg falls back to the system binary if the `imageio-ffmpeg` one is unavailable.
 
 ## TTS fallback chain (`synthesise()`)
 1. edge-tts with `rate=RATE, pitch=PITCH`, so no ffmpeg filter is needed.
@@ -98,7 +111,8 @@ Each failure is logged with its exception type, for example `edge-tts (plain) fa
 - The `last_clip.mp3` diagnostic copy was removed.
 
 ## Constraints and caveats
-- **Uptime:** the bot is online only while the host PC is on and the `start.bat` window is open. Free 24/7 hosting was not set up.
+- **Uptime:** on Windows the bot is online only while the host PC is on and `start.bat` is open. Render free hosting is prepared but **not yet verified** — open risks: Render may block outbound UDP (voice), shared IPs can get Discord `429` blocks, and the free instance sleeps after 15 min without inbound HTTP (hence the cron ping to `/health`). Cloudflare Workers / Vercel cannot host this bot (no persistent process, no UDP); Railway / Fly.io have no usable free tier.
+- Never run two copies with the same token (PC + cloud): both would read every message.
 - **edge-tts** uses Microsoft's undocumented Edge "Read Aloud" endpoint. It is free but unofficial, and it can break without notice. **gTTS** is the same kind of unofficial endpoint, for Google Translate.
 - **Privileged intents** (Message Content) need Discord review only once the bot reaches 10,000+ users. That is not relevant here.
 - **Privacy:** the bot reads members' messages aloud. Server members should be told that a TTS bot is active in the bound channel. Nothing is stored.

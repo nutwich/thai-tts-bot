@@ -1,0 +1,26 @@
+# Render Blueprint: New > Blueprint > pick this repo. The token is asked for in the dashboard.
+services:
+  - type: web
+    name: thai-tts-bot
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false        # secret: typed into the Render dashboard, never stored in git
+      - key: TTS_VOICE
+        value: female
+      - key: TTS_RATE
+        value: "+50%"
+      - key: TTS_PITCH
+        value: "+15Hz"
+      - key: READ_NAME
+        value: "false"
+      - key: MAX_CHARS
+        value: "300"
+      - key: AUTO_JOIN
+        value: "true"
+      - key: READ_CHANNEL_ID
+        sync: false        # optional: extra text channel that can summon the bot

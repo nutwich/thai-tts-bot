@@ -8,17 +8,27 @@ Thai TTS Discord bot (th-TH only)
 import asyncio
 import os
 import re
+import shutil
+import sys
 import time
 import tempfile
 
 import discord
 import edge_tts
 import imageio_ffmpeg
+from aiohttp import web   # installed with discord.py
 from gtts import gTTS
 from discord import app_commands
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# show log lines immediately (also when running as a Linux service), and never
+# crash on a channel/user name the console can't display (emoji etc.)
+try:
+    sys.stdout.reconfigure(line_buffering=True, errors="replace")
+except AttributeError:
+    pass
 
 # ---------------------------------------------------------------- settings ---
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -32,8 +42,41 @@ RATE = os.getenv("TTS_RATE", "+50%")     # +50% = 1.5x speed
 PITCH = os.getenv("TTS_PITCH", "+15Hz")  # slightly higher than normal
 READ_NAME = os.getenv("READ_NAME", "false").lower() == "true"  # say "<name>:" first
 MAX_CHARS = int(os.getenv("MAX_CHARS", "300"))
+# join by itself when someone in a voice channel types in that channel's chat
+AUTO_JOIN = os.getenv("AUTO_JOIN", "true").lower() == "true"
+# optional extra text channel that also triggers auto-join (joins the typer's voice channel)
+READ_CHANNEL_ID = int(os.getenv("READ_CHANNEL_ID", "").strip() or 0)
 
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # bundled ffmpeg, nothing to install
+
+def _find_ffmpeg() -> str:
+    """Bundled ffmpeg first (nothing to install); system ffmpeg as a backup."""
+    try:
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        system = shutil.which("ffmpeg")
+        if system:
+            return system
+        raise SystemExit("ไม่พบ ffmpeg — ติดตั้งด้วย: sudo apt install ffmpeg")
+
+
+FFMPEG = _find_ffmpeg()
+
+
+def _check_opus():
+    """Windows: discord.py ships opus. Linux: needs the libopus0 system package."""
+    if not discord.opus.is_loaded():
+        try:
+            discord.opus._load_default()
+        except Exception:
+            pass
+    if not discord.opus.is_loaded():
+        try:
+            discord.opus.load_opus("libopus.so.0")
+        except Exception:
+            pass
+    if not discord.opus.is_loaded():
+        print("WARNING: Opus library not found, voice will not work. "
+              "On Ubuntu/Debian run: sudo apt install libopus0")
 
 # ------------------------------------------------------------------ client ---
 intents = discord.Intents.default()
@@ -49,9 +92,16 @@ class TTSBot(discord.Client):
         self.workers: dict[int, asyncio.Task] = {}
         self.read_channel: dict[int, int] = {}   # guild_id -> text channel id
         self.voice_choice: dict[int, str] = {}   # guild_id -> "female"/"male"
+        self.last_text: dict[int, int] = {}      # guild_id -> text channel of the last /join
+        self.auto_paused: set[int] = set()       # guilds where /leave was used
+        self.connect_locks: dict[int, asyncio.Lock] = {}
+        self._health = None
 
     async def setup_hook(self):
         await self.tree.sync()
+        port = os.getenv("PORT")   # set by Render and similar hosts
+        if port:
+            self._health = await start_health_server(int(port))
 
     async def on_ready(self):
         print(f"Logged in as {self.user} | servers: {len(self.guilds)}")
@@ -188,17 +238,17 @@ def enqueue(guild: discord.Guild, text: str):
     queue.put_nowait((task, time.monotonic()))
 
 
-# --------------------------------------------------------------- commands ---
-@bot.tree.command(name="join", description="ให้บอทเข้าห้องเสียงและอ่านข้อความในห้องแชทนี้")
-async def join(interaction: discord.Interaction):
-    member = interaction.user
-    if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
-        return await interaction.response.send_message("กรุณาเข้าห้องเสียงก่อน", ephemeral=True)
-    # connecting can take several seconds; tell Discord we are working on it
-    await interaction.response.defer(thinking=True)
-    channel = member.voice.channel
-    guild = interaction.guild
+# ------------------------------------------------------------ voice / join ---
+def humans(channel) -> list:
+    return [m for m in channel.members if not m.bot]
 
+
+def _lock(guild: discord.Guild) -> asyncio.Lock:
+    return bot.connect_locks.setdefault(guild.id, asyncio.Lock())
+
+
+async def _connect(guild: discord.Guild, channel) -> bool:
+    """Connect (or move) to a voice channel, with one retry. Call with _lock held."""
     for attempt in (1, 2):
         try:
             vc = guild.voice_client
@@ -209,7 +259,7 @@ async def join(interaction: discord.Interaction):
                 if vc:  # half-open connection left over from a failed try
                     await vc.disconnect(force=True)
                 await channel.connect(self_deaf=True, timeout=20, reconnect=True)
-            break
+            return True
         except Exception as e:
             print(f"[{guild.name}] voice connect attempt {attempt} failed: {type(e).__name__}: {e}")
             if guild.voice_client:
@@ -217,13 +267,67 @@ async def join(interaction: discord.Interaction):
                     await guild.voice_client.disconnect(force=True)
                 except Exception:
                     pass
-            if attempt == 2:
-                return await interaction.followup.send(
-                    "❌ เชื่อมต่อห้องเสียงไม่สำเร็จ ลอง /join อีกครั้งในอีกสักครู่"
-                )
-            await asyncio.sleep(2)
+            if attempt == 1:
+                await asyncio.sleep(2)
+    return False
+
+
+async def auto_join_from_message(message: discord.Message):
+    """Someone in a voice channel typed in that channel's chat (or in READ_CHANNEL_ID /
+    the last /join channel) while the bot is not in voice: join them and read there."""
+    guild = message.guild
+    member = message.author
+    voice = member.voice.channel if isinstance(member, discord.Member) and member.voice else None
+    if (voice is None or not isinstance(voice, discord.VoiceChannel)
+            or voice == guild.afk_channel or guild.id in bot.auto_paused):
+        return
+    if message.channel.id not in (voice.id, READ_CHANNEL_ID, bot.last_text.get(guild.id)):
+        return
+    if not voice.permissions_for(guild.me).connect:
+        return
+    async with _lock(guild):   # several messages at once -> connect only once
+        if guild.voice_client:
+            return
+        if await _connect(guild, voice):
+            bot.read_channel[guild.id] = message.channel.id
+            print(f"[{guild.name}] auto-joined {voice.name} (message in #{message.channel.name})")
+
+
+async def start_health_server(port: int) -> web.AppRunner:
+    """Tiny web page so free hosts (Render) see a web service and cron can ping it."""
+    async def ok(_request):
+        return web.Response(text="ok")
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    print(f"Health check listening on port {port}")
+    return runner
+
+
+# --------------------------------------------------------------- commands ---
+@bot.tree.command(name="join", description="ให้บอทเข้าห้องเสียงและอ่านข้อความในห้องแชทนี้")
+async def join(interaction: discord.Interaction):
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
+        return await interaction.response.send_message("กรุณาเข้าห้องเสียงก่อน", ephemeral=True)
+    # connecting can take several seconds; tell Discord we are working on it
+    await interaction.response.defer(thinking=True)
+    channel = member.voice.channel
+    guild = interaction.guild
+    bot.auto_paused.discard(guild.id)
+
+    async with _lock(guild):
+        ok = await _connect(guild, channel)
+    if not ok:
+        return await interaction.followup.send(
+            "❌ เชื่อมต่อห้องเสียงไม่สำเร็จ ลอง /join อีกครั้งในอีกสักครู่"
+        )
 
     bot.read_channel[guild.id] = interaction.channel.id
+    bot.last_text[guild.id] = interaction.channel.id
     await interaction.followup.send(
         f"🔊 เข้าห้อง **{channel.name}** แล้ว จะอ่านข้อความใน {interaction.channel.mention}"
     )
@@ -235,6 +339,8 @@ async def leave(interaction: discord.Interaction):
     if vc:
         await vc.disconnect()
     bot.read_channel.pop(interaction.guild.id, None)
+    if AUTO_JOIN:  # don't jump straight back in; resumes once everyone has left voice
+        bot.auto_paused.add(interaction.guild.id)
     await interaction.response.send_message("👋 ออกจากห้องเสียงแล้ว")
 
 
@@ -270,6 +376,8 @@ async def voice(interaction: discord.Interaction, gender: app_commands.Choice[st
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
+    if AUTO_JOIN and not message.guild.voice_client:
+        await auto_join_from_message(message)   # then read this message too
     if bot.read_channel.get(message.guild.id) != message.channel.id:
         return
     if not message.guild.voice_client:
@@ -284,14 +392,20 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    guild = member.guild
     # leave automatically when everyone else has left the voice channel
-    vc = member.guild.voice_client
-    if vc and vc.channel and all(m.bot for m in vc.channel.members):
+    vc = guild.voice_client
+    if vc and vc.channel and not humans(vc.channel):
         await vc.disconnect()
-        bot.read_channel.pop(member.guild.id, None)
+        bot.read_channel.pop(guild.id, None)
+
+    # after /leave, auto-join resumes once everyone has left voice
+    if guild.id in bot.auto_paused and not any(humans(ch) for ch in guild.voice_channels):
+        bot.auto_paused.discard(guild.id)
 
 
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("ไม่พบ DISCORD_TOKEN — กรุณาใส่โทเคนในไฟล์ .env")
+    _check_opus()
     bot.run(TOKEN)
