@@ -2,16 +2,19 @@
 Thai TTS Discord bot (th-TH only)
 - Free: uses Microsoft Edge's online neural voices via edge-tts (no API key, no cost)
 - Reads messages from one text channel aloud in the voice channel it has joined
-- Slash commands: /join, /leave, /say, /skip, /voice
+- Slash commands: /join, /leave, /say, /skip, /voice, /myvoice, /resetvoice
+- Settings (/myvoice, /voice) are kept in MongoDB Atlas (free) when MONGODB_URI is set
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
 import sys
 import time
 import tempfile
+from typing import Optional
 
 import discord
 import edge_tts
@@ -46,6 +49,36 @@ MAX_CHARS = int(os.getenv("MAX_CHARS", "300"))
 AUTO_JOIN = os.getenv("AUTO_JOIN", "true").lower() == "true"
 # optional extra text channel that also triggers auto-join (joins the typer's voice channel)
 READ_CHANNEL_ID = int(os.getenv("READ_CHANNEL_ID", "").strip() or 0)
+
+
+def _env_num(name: str, default, cast=float):
+    try:
+        return cast(os.getenv(name, "").strip().rstrip("%Hzx") or default)
+    except ValueError:
+        return default
+
+
+# server-wide defaults (from TTS_RATE / TTS_PITCH)
+try:
+    DEFAULT_SPEED = max(0.5, 1 + int(RATE.strip().rstrip("%")) / 100)   # +50% -> 1.5
+except ValueError:
+    DEFAULT_SPEED = 1.5
+try:
+    DEFAULT_PITCH = int(PITCH.strip().rstrip("Hz").rstrip("hz"))          # +15Hz -> 15
+except ValueError:
+    DEFAULT_PITCH = 15
+
+# limits for each member's own /myvoice settings
+SPEED_MIN = _env_num("SPEED_MIN", 1.0)
+SPEED_MAX = max(SPEED_MIN + 0.1, _env_num("SPEED_MAX", 2.0))
+PITCH_MIN = _env_num("PITCH_MIN", -20, int)
+PITCH_MAX = max(PITCH_MIN + 1, _env_num("PITCH_MAX", 40, int))
+
+# per-member settings survive restarts (only voice/speed/pitch, never messages)
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_settings.json")
+# optional free MongoDB Atlas database so settings are never lost (secret, like the token)
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+MONGODB_DB = os.getenv("MONGODB_DB", "").strip() or "thai_tts_bot"
 
 
 def _find_ffmpeg() -> str:
@@ -84,6 +117,57 @@ intents.message_content = True   # must also be switched on in the Developer Por
 intents.voice_states = True
 
 
+# --------------------------------------------------------- settings storage ---
+# "users":  user_id  -> {"voice", "speed", "pitch"}   (/myvoice, same in every server)
+# "guilds": guild_id -> {"voice"}                      (/voice server default)
+# With MONGODB_URI (MongoDB Atlas free M0) the database is the real copy, so cloud
+# redeploys and moving between PC and cloud lose nothing. user_settings.json next to
+# bot.py is always kept too: the only store without a database, otherwise an offline
+# copy plus a list of changes not yet saved to the database ("pending").
+KINDS = ("users", "guilds")
+
+
+def _safe_err(e: Exception) -> str:
+    """Exception text without the connection string (it contains the DB password)."""
+    msg = str(e)
+    if MONGODB_URI:
+        msg = msg.replace(MONGODB_URI, "<MONGODB_URI>")
+    return f"{type(e).__name__}: {msg[:200]}"
+
+
+def load_local_settings() -> dict:
+    state = {"users": {}, "guilds": {}, "pending": {"users": [], "guilds": []}}
+    try:
+        with open(SETTINGS_FILE, "rb") as f:
+            data = json.loads(f.read())
+    except FileNotFoundError:
+        return state
+    except Exception as e:
+        print(f"WARNING: could not read user_settings.json ({type(e).__name__}); starting empty")
+        return state
+    if not isinstance(data, dict):
+        return state
+    if not isinstance(data.get("users"), dict):   # first version: the file was only the users
+        data = {"users": data}
+    for kind in KINDS:
+        if isinstance(data.get(kind), dict):
+            state[kind] = data[kind]
+        pending = (data.get("pending") or {}).get(kind)
+        if isinstance(pending, list):
+            state["pending"][kind] = [str(k) for k in pending]
+    return state
+
+
+def write_local_settings(state: dict):
+    tmp = SETTINGS_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, SETTINGS_FILE)
+    except OSError as e:
+        print(f"WARNING: could not save settings file: {e}")
+
+
 class TTSBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
@@ -91,17 +175,103 @@ class TTSBot(discord.Client):
         self.queues: dict[int, asyncio.Queue] = {}
         self.workers: dict[int, asyncio.Task] = {}
         self.read_channel: dict[int, int] = {}   # guild_id -> text channel id
-        self.voice_choice: dict[int, str] = {}   # guild_id -> "female"/"male"
+        local = load_local_settings()
+        self.user_settings: dict[str, dict] = local["users"]    # user_id -> voice/speed/pitch
+        self.guild_settings: dict[str, dict] = local["guilds"]  # guild_id -> voice
+        # ids changed but not yet saved to MongoDB (kept in the file across restarts)
+        self._pending: dict[str, set] = {k: set(local["pending"][k]) for k in KINDS}
+        self._db = None
+        self._sync_task: Optional[asyncio.Task] = None
         self.last_text: dict[int, int] = {}      # guild_id -> text channel of the last /join
         self.auto_paused: set[int] = set()       # guilds where /leave was used
         self.connect_locks: dict[int, asyncio.Lock] = {}
         self._health = None
 
     async def setup_hook(self):
-        await self.tree.sync()
         port = os.getenv("PORT")   # set by Render and similar hosts
+        if MONGODB_URI:
+            await self.connect_database()
+        elif port:
+            print("WARNING: MONGODB_URI is not set, so /myvoice and /voice settings "
+                  "will be lost on every cloud redeploy")
+        await self.tree.sync()
         if port:
             self._health = await start_health_server(int(port))
+
+    # ----- settings: MongoDB + local file -----
+    async def connect_database(self):
+        """Save changes made while offline, then load everything from MongoDB.
+        If MongoDB is unreachable the local copy is used and saving is retried."""
+        try:
+            from pymongo import AsyncMongoClient
+            client = AsyncMongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000,
+                                      appname="thai-tts-bot")
+            self._db = client[MONGODB_DB]
+        except Exception as e:   # bad connection string or pymongo missing: no point retrying
+            print(f"WARNING: MongoDB not usable ({_safe_err(e)}); using the local file only")
+            return
+        try:
+            await self._flush_pending()          # local changes not saved last time
+            fresh = {}
+            for kind in KINDS:
+                fresh[kind] = {}
+                async for doc in self._db[kind].find({}):
+                    fresh[kind][str(doc.pop("_id"))] = doc
+        except Exception as e:
+            print(f"WARNING: MongoDB unreachable ({_safe_err(e)}); using the local copy for now")
+            self._schedule_sync()
+            return
+        self.user_settings, self.guild_settings = fresh["users"], fresh["guilds"]
+        self._write_local()
+        print(f"Loaded settings from MongoDB: {len(self.user_settings)} member(s), "
+              f"{len(self.guild_settings)} server(s)")
+
+    def set_setting(self, kind: str, key: str, doc: Optional[dict]):
+        """Change one member's ("users") or server's ("guilds") settings; None removes them.
+        Writes the local file now and MongoDB in the background."""
+        store = self.user_settings if kind == "users" else self.guild_settings
+        if doc:
+            store[key] = dict(doc)
+        else:
+            store.pop(key, None)
+        self._pending[kind].add(key)
+        self._write_local()
+        self._schedule_sync()
+
+    def _write_local(self):
+        write_local_settings({
+            "users": self.user_settings,
+            "guilds": self.guild_settings,
+            "pending": {k: sorted(v) for k, v in self._pending.items()},
+        })
+
+    def _schedule_sync(self):
+        if self._db is not None and (self._sync_task is None or self._sync_task.done()):
+            self._sync_task = asyncio.create_task(self._sync_worker())
+
+    async def _sync_worker(self):
+        failures = 0
+        while any(self._pending.values()):
+            await asyncio.sleep(1 if failures == 0 else min(300, 30 * failures))
+            try:
+                await self._flush_pending()
+                failures = 0
+            except Exception as e:
+                failures += 1
+                print(f"WARNING: saving settings to MongoDB failed ({_safe_err(e)}); will retry")
+
+    async def _flush_pending(self):
+        for kind in KINDS:
+            store = self.user_settings if kind == "users" else self.guild_settings
+            for key in sorted(self._pending[kind]):
+                doc = dict(store[key]) if key in store else None
+                if doc:
+                    await self._db[kind].replace_one({"_id": key}, doc, upsert=True)
+                else:
+                    await self._db[kind].delete_one({"_id": key})
+                if store.get(key) == doc:        # not changed again while saving
+                    self._pending[kind].discard(key)
+        self._write_local()
 
     async def on_ready(self):
         print(f"Logged in as {self.user} | servers: {len(self.guilds)}")
@@ -126,14 +296,41 @@ def clean_text(message: discord.Message) -> str:
     return text
 
 
-# ffmpeg filter used when the engine itself cannot change speed/pitch.
-# Follows TTS_RATE (e.g. +50% -> 1.5x) and raises pitch ~6%.
-try:
-    _SPEED = max(0.5, 1 + int(RATE.strip().rstrip("%")) / 100)
-except ValueError:
-    _SPEED = 1.5
-SPEED_PITCH_FILTER = (f'-af "aresample=48000,asetrate=50880,aresample=48000,'
-                      f'atempo={_SPEED / 1.06:.3f}"')
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def voice_params(guild_id: int, user_id: int | None) -> tuple[str, float, int]:
+    """(voice key, speed, pitch Hz) for this member: own /myvoice settings within
+    the limits, otherwise the server defaults."""
+    s = bot.user_settings.get(str(user_id), {}) if user_id else {}
+    gender = (s.get("voice") or bot.guild_settings.get(str(guild_id), {}).get("voice")
+              or DEFAULT_VOICE)
+    if gender not in VOICES:
+        gender = "female"
+    try:
+        speed = _clamp(float(s["speed"]), SPEED_MIN, SPEED_MAX) if "speed" in s else DEFAULT_SPEED
+        pitch = _clamp(int(s["pitch"]), PITCH_MIN, PITCH_MAX) if "pitch" in s else DEFAULT_PITCH
+    except (TypeError, ValueError):
+        speed, pitch = DEFAULT_SPEED, DEFAULT_PITCH
+    return gender, speed, pitch
+
+
+def speed_pitch_filter(speed: float, pitch_hz: int) -> str:
+    """ffmpeg filter used when the engine itself cannot change speed/pitch.
+    +15 Hz ~ 6% higher (asetrate 50880), like edge-tts' pitch shift."""
+    ratio = _clamp(1 + pitch_hz / 250, 0.8, 1.25)
+    tempo = speed / ratio
+    steps = []
+    while tempo > 2.0:      # older ffmpeg builds accept atempo 0.5..2.0 only
+        steps.append("atempo=2.0")
+        tempo /= 2.0
+    while tempo < 0.5:
+        steps.append("atempo=0.5")
+        tempo /= 0.5
+    steps.append(f"atempo={tempo:.3f}")
+    return (f'-af "aresample=48000,asetrate={round(48000 * ratio)},aresample=48000,'
+            f'{",".join(steps)}"')
 
 
 EDGE_TIMEOUT = 3.0          # seconds to wait for Microsoft before using Google
@@ -147,10 +344,11 @@ def _tmp_mp3() -> str:
     return path
 
 
-async def _edge(text: str, voice: str) -> str:
+async def _edge(text: str, voice: str, speed: float, pitch: int) -> str:
     path = _tmp_mp3()
     try:
-        await edge_tts.Communicate(text, voice, rate=RATE, pitch=PITCH).save(path)
+        rate = f"{round((speed - 1) * 100):+d}%"   # 1.5 -> +50%
+        await edge_tts.Communicate(text, voice, rate=rate, pitch=f"{pitch:+d}Hz").save(path)
         if os.path.getsize(path) == 0:
             raise RuntimeError("empty audio")
         return path
@@ -177,25 +375,27 @@ def _safe_remove(path):
         pass
 
 
-async def synthesise(text: str, guild_id: int) -> tuple[str, str, str]:
+async def synthesise(text: str, guild_id: int, user_id: int | None = None) -> tuple[str, str, str]:
     """Returns (mp3 path, extra ffmpeg options, engine name)."""
     global _edge_disabled_until
-    voice = VOICES[bot.voice_choice.get(guild_id, DEFAULT_VOICE)]
+    gender, speed, pitch = voice_params(guild_id, user_id)
+    voice = VOICES[gender]
+    fallback_filter = speed_pitch_filter(speed, pitch)
 
     if time.monotonic() < _edge_disabled_until:
-        return await _google(text), SPEED_PITCH_FILTER, "google"
+        return await _google(text), fallback_filter, "google"
 
     # ask both at the same time; prefer Microsoft if it answers quickly
     google_task = asyncio.create_task(_google(text))
     try:
-        path = await asyncio.wait_for(_edge(text, voice), timeout=EDGE_TIMEOUT)
+        path = await asyncio.wait_for(_edge(text, voice, speed, pitch), timeout=EDGE_TIMEOUT)
         google_task.add_done_callback(
             lambda t: _safe_remove(t.result()) if not t.cancelled() and not t.exception() else None)
         return path, "", "microsoft"
     except Exception as e:
         _edge_disabled_until = time.monotonic() + EDGE_COOLDOWN
         print(f"  Microsoft voice unavailable ({type(e).__name__}); using Google for the next 10 min")
-        return await google_task, SPEED_PITCH_FILTER, "google"
+        return await google_task, fallback_filter, "google"
 
 
 async def player(guild: discord.Guild):
@@ -227,14 +427,14 @@ async def player(guild: discord.Guild):
             _safe_remove(path)
 
 
-def enqueue(guild: discord.Guild, text: str):
+def enqueue(guild: discord.Guild, text: str, user_id: int | None = None):
     if guild.id not in bot.queues:
         bot.queues[guild.id] = asyncio.Queue(maxsize=20)
         bot.workers[guild.id] = asyncio.create_task(player(guild))
     queue = bot.queues[guild.id]
     if queue.full():
         return  # drop spam rather than lag behind
-    task = asyncio.create_task(synthesise(text, guild.id))
+    task = asyncio.create_task(synthesise(text, guild.id, user_id))
     queue.put_nowait((task, time.monotonic()))
 
 
@@ -349,7 +549,7 @@ async def leave(interaction: discord.Interaction):
 async def say(interaction: discord.Interaction, text: str):
     if not interaction.guild.voice_client:
         return await interaction.response.send_message("ใช้ /join ก่อน", ephemeral=True)
-    enqueue(interaction.guild, text[:MAX_CHARS])
+    enqueue(interaction.guild, text[:MAX_CHARS], interaction.user.id)
     await interaction.response.send_message("✅", ephemeral=True)
 
 
@@ -367,8 +567,65 @@ async def skip(interaction: discord.Interaction):
     app_commands.Choice(name="ผู้ชาย (Niwat)", value="male"),
 ])
 async def voice(interaction: discord.Interaction, gender: app_commands.Choice[str]):
-    bot.voice_choice[interaction.guild.id] = gender.value
-    await interaction.response.send_message(f"เปลี่ยนเป็นเสียง{gender.name}แล้ว")
+    bot.set_setting("guilds", str(interaction.guild.id), {"voice": gender.value})
+    await interaction.response.send_message(
+        f"เปลี่ยนเสียงเริ่มต้นของเซิร์ฟเวอร์เป็นเสียง{gender.name}แล้ว "
+        f"(คนที่ตั้ง /myvoice ไว้จะใช้เสียงของตัวเอง)")
+
+
+VOICE_NAMES = {"female": "ผู้หญิง", "male": "ผู้ชาย"}
+
+
+def describe_settings(guild_id: int, user_id: int) -> str:
+    gender, speed, pitch = voice_params(guild_id, user_id)
+    own = bot.user_settings.get(str(user_id), {})
+    tag = lambda key: "" if key in own else " (ค่าเริ่มต้น)"
+    return (f"🗣️ เสียง: **{VOICE_NAMES[gender]}**{tag('voice')}\n"
+            f"⏩ ความเร็ว: **{speed:g}x**{tag('speed')}\n"
+            f"🎵 ระดับเสียง: **{pitch:+d}**{tag('pitch')}\n"
+            f"-# ลิมิต: ความเร็ว {SPEED_MIN:g}–{SPEED_MAX:g}x · ระดับเสียง {PITCH_MIN:+d} ถึง {PITCH_MAX:+d}")
+
+
+@bot.tree.command(name="myvoice", description="ตั้งเสียง ความเร็ว และระดับเสียงที่บอทใช้อ่านข้อความของคุณ")
+@app_commands.describe(
+    voice="เสียงผู้หญิงหรือผู้ชาย",
+    speed=f"ความเร็ว {SPEED_MIN:g}–{SPEED_MAX:g} เท่า (เช่น 1.5)",
+    pitch=f"ระดับเสียง {PITCH_MIN:+d} ถึง {PITCH_MAX:+d} (0 = ปกติ, มาก = เสียงสูง)",
+)
+@app_commands.choices(voice=[
+    app_commands.Choice(name="ผู้หญิง (Premwadee)", value="female"),
+    app_commands.Choice(name="ผู้ชาย (Niwat)", value="male"),
+])
+async def myvoice(
+    interaction: discord.Interaction,
+    voice: Optional[app_commands.Choice[str]] = None,
+    speed: Optional[app_commands.Range[float, SPEED_MIN, SPEED_MAX]] = None,
+    pitch: Optional[app_commands.Range[int, PITCH_MIN, PITCH_MAX]] = None,
+):
+    key = str(interaction.user.id)
+    if voice is None and speed is None and pitch is None:   # just show current settings
+        return await interaction.response.send_message(
+            describe_settings(interaction.guild_id, interaction.user.id), ephemeral=True)
+    s = dict(bot.user_settings.get(key, {}))   # copy: the saver compares old vs new
+    if voice is not None:
+        s["voice"] = voice.value
+    if speed is not None:
+        s["speed"] = round(_clamp(speed, SPEED_MIN, SPEED_MAX), 2)
+    if pitch is not None:
+        s["pitch"] = _clamp(pitch, PITCH_MIN, PITCH_MAX)
+    bot.set_setting("users", key, s)
+    await interaction.response.send_message(
+        "✅ บันทึกแล้ว\n" + describe_settings(interaction.guild_id, interaction.user.id),
+        ephemeral=True)
+
+
+@bot.tree.command(name="resetvoice", description="กลับไปใช้เสียงและความเร็วเริ่มต้นของเซิร์ฟเวอร์")
+async def resetvoice(interaction: discord.Interaction):
+    if str(interaction.user.id) in bot.user_settings:
+        bot.set_setting("users", str(interaction.user.id), None)
+    await interaction.response.send_message(
+        "↩️ กลับเป็นค่าเริ่มต้นแล้ว\n" + describe_settings(interaction.guild_id, interaction.user.id),
+        ephemeral=True)
 
 
 # ----------------------------------------------------------------- events ---
@@ -387,7 +644,7 @@ async def on_message(message: discord.Message):
         return
     if READ_NAME:
         text = f"{message.author.display_name}: {text}"
-    enqueue(message.guild, text)
+    enqueue(message.guild, text, message.author.id)
 
 
 @bot.event

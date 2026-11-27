@@ -11,6 +11,7 @@
 4. Render อ่านไฟล์ `render.yaml` แล้วจะถามค่า:
    - **DISCORD_TOKEN** → วาง token บอท (ใส่ตรงนี้ที่เดียว ห้ามใส่ในไฟล์ใน GitHub)
    - **READ_CHANNEL_ID** → เว้นว่างได้ (ดูข้อ 4)
+   - **MONGODB_URI** → ลิงก์ฐานข้อมูล MongoDB (ดูข้อ 5) ถ้าไม่ใส่ ค่า /myvoice และ /voice จะหายทุกครั้งที่ Render build ใหม่
 5. กด **Apply** รอ build ประมาณ 3–5 นาที
 6. เปิดหน้า service → แท็บ **Logs** ถ้าเห็น `Logged in as บอทท่านจิน#2654` = ออนไลน์แล้ว
 7. จดลิงก์ของบอทที่มุมบนซ้าย เช่น `https://thai-tts-bot-xxxx.onrender.com`
@@ -41,6 +42,21 @@ Render ฟรีจะหลับถ้าไม่มีคนเข้าล�
 ถ้าอยากให้พิมพ์ใน **ห้องแชทปกติ** (เช่น #general) แล้วบอทเข้าห้องเสียงที่คนพิมพ์อยู่:
 Discord: *User Settings → Advanced → เปิด Developer Mode* → คลิกขวาห้องแชท → **Copy Channel ID** → ใส่ใน `READ_CHANNEL_ID`
 (เว้นว่าง = ใช้แค่แชทในห้องเสียง)
+
+## 5. ฐานข้อมูล MongoDB (กันค่า /myvoice และ /voice หาย)
+Render ฟรีจะล้างไฟล์ทุกครั้งที่ build ใหม่ บอทเลยเก็บค่าไว้ใน **MongoDB Atlas** แบบฟรี (M0 ฟรีถาวร ไม่ต้องใช้บัตร) ใช้ได้ทุกเซิร์ฟเวอร์ที่บอทอยู่
+1. ไปที่ https://www.mongodb.com/cloud/atlas/register → สมัครด้วย Google ก็ได้
+2. **Create cluster** → เลือก **M0 / Free** → Provider อะไรก็ได้ → Region **Singapore** (ใกล้ Render) → Create
+3. **Database Access** (หรือหน้าที่ขึ้นมาให้สร้าง user) → สร้าง user + กด **Autogenerate password** (รหัสเป็นตัวอักษร/ตัวเลขล้วน) → สิทธิ์ **Read and write to any database**
+4. **Network Access** → **Add IP Address** → **Allow access from anywhere** (`0.0.0.0/0`) เพราะ IP ของ Render เปลี่ยนเรื่อย ๆ (รหัสผ่านยังป้องกันอยู่)
+5. **Connect** → **Drivers** → Python → copy ลิงก์แบบ `mongodb+srv://ชื่อuser:<db_password>@cluster0.xxxxx.mongodb.net/?...` → เปลี่ยน `<db_password>` เป็นรหัสจากข้อ 3
+6. ใส่ลิงก์นี้ใน `MONGODB_URI` (Render: หน้า service → **Environment** / บนคอม: ไฟล์ `.env`)
+7. เปิดบอทใหม่ ถ้า Logs ขึ้น `Loaded settings from MongoDB: ...` = ต่อได้แล้ว
+
+> 🔒 ลิงก์นี้มี **รหัสผ่านฐานข้อมูล** อยู่ในตัว เก็บให้ลับเหมือน token บอท ห้ามโพสต์หรือใส่ใน GitHub ถ้าหลุด → Database Access → Edit → เปลี่ยนรหัส แล้วแก้ลิงก์ใหม่
+
+- ใส่ลิงก์เดียวกันทั้งคอมและ Render ได้ ย้ายไปมาค่าก็ตามไป (แต่อย่ารันบอท 2 ที่พร้อมกัน)
+- ถ้า MongoDB ล่มชั่วคราว บอทใช้ไฟล์ในเครื่องต่อ แล้วบันทึกขึ้นฐานข้อมูลให้เองเมื่อต่อได้
 
 แก้ค่าทีหลังได้ที่ Render: หน้า service → **Environment** → แก้ → **Save Changes** (บอทรีสตาร์ทเอง)
 

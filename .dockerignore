@@ -3,3 +3,4 @@
 .git/
 __pycache__/
 *.mp3
+user_settings.json

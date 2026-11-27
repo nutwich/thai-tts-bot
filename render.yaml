@@ -24,3 +24,5 @@ services:
         value: "true"
       - key: READ_CHANNEL_ID
         sync: false        # optional: extra text channel that can summon the bot
+      - key: MONGODB_URI
+        sync: false        # secret: MongoDB Atlas connection string (see CLOUD_SETUP.md step 5)

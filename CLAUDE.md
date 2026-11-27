@@ -23,6 +23,7 @@ Hard requirement: **100% free**. No paid APIs, no paid hosting, no API keys apar
 | TTS, fallback | `gTTS` (Google Translate, `lang="th"`) | Free; used only if edge-tts fails twice |
 | Audio | `imageio-ffmpeg` (bundled ffmpeg binary) | No manual ffmpeg install on Windows |
 | Config | `python-dotenv` → `.env` | Keeps the token out of the code |
+| Settings DB | `pymongo>=4.13` → MongoDB Atlas M0 (optional, via `MONGODB_URI`) | Free forever with no card; the owner chose it so `/myvoice` and `/voice` survive cloud redeploys across all servers |
 
 ## Files (`Documents\thai-tts-bot\` on the host PC)
 - `bot.py`: the whole bot (single file).
@@ -44,6 +45,12 @@ READ_NAME=false         # true = prefix "<display name>:" before each message
 MAX_CHARS=300           # truncate long messages ("และอื่นๆ")
 AUTO_JOIN=true          # someone in voice types in that voice channel's chat -> bot joins
 READ_CHANNEL_ID=        # optional extra text channel that can also summon the bot
+SPEED_MIN=1.0           # /myvoice speed limits (x)
+SPEED_MAX=2.0
+PITCH_MIN=-20           # /myvoice pitch limits (Hz)
+PITCH_MAX=40
+MONGODB_URI=            # SECRET: MongoDB Atlas (free M0) connection string, contains the DB password
+MONGODB_DB=             # optional database name, default thai_tts_bot
 PORT=                   # set by Render: starts an aiohttp /health endpoint for cron pings
 ```
 
@@ -53,7 +60,25 @@ PORT=                   # set by Render: starts an aiohttp /health endpoint for 
   - `/leave` — disconnects and unbinds.
   - `/say text` — speaks arbitrary text.
   - `/skip` — stops the current clip.
-  - `/voice female|male` — switches the voice for that server.
+  - `/voice female|male` — switches the **server default** voice.
+  - `/myvoice [voice] [speed] [pitch]` — each member sets their own voice, speed (x) and pitch (Hz) for their messages and `/say`. Discord enforces the limits (`app_commands.Range` from `SPEED_MIN/MAX`, `PITCH_MIN/MAX`), and stored values are clamped again when they are used. Options left out are kept. With no options it shows the current settings (ephemeral).
+  - `/resetvoice` — removes that member's own settings (back to the server defaults).
+- **Settings storage.** The owner does not want settings lost, and the bot is in several servers. Render wipes its disk on redeploy.
+  - Two kinds of data:
+    - `users`: user ID → voice/speed/pitch. This is global, the same in every server.
+    - `guilds`: guild ID → `/voice` default.
+  - **MongoDB Atlas M0** (free, no card) is the real copy when `MONGODB_URI` is set.
+    - Database `MONGODB_DB` (default `thai_tts_bot`), with collections `users` and `guilds`. `_id` is the Discord ID as a string.
+    - Uses `pymongo` `AsyncMongoClient`.
+  - `user_settings.json` next to `bot.py` (git- and docker-ignored) is always written. It is the only store when there is no database, otherwise an offline cache.
+    - Format: `{"users", "guilds", "pending": {"users": [...], "guilds": [...]}}`. A bare users dict from the first version is still read.
+  - Changes go through `bot.set_setting(kind, key, doc|None)`. It writes the file now and adds the key to `pending`. `_sync_worker` then upserts or deletes in MongoDB, with backoff up to 5 min.
+    - A key leaves `pending` only if it was not changed again while saving. Pass a **new dict**, not a mutated one.
+  - At start, `setup_hook` → `connect_database()` first flushes `pending` from the file (changes made while offline), then loads everything from MongoDB.
+    - If MongoDB is unreachable, the local copy is used and saving is retried.
+  - Error text goes through `_safe_err()`, so the URI (which contains the password) is never logged.
+  - On Render without `MONGODB_URI`, a warning is logged.
+- `voice_params()` resolves voice/speed/pitch per message: member setting → server `/voice` → `.env` defaults. edge-tts gets `rate=f"{(speed-1)*100:+d}%"`, `pitch=f"{pitch:+d}Hz"`; the gTTS fallback uses `speed_pitch_filter(speed, pitch)` (pitch ratio `1 + Hz/250`, so +15 Hz ≈ 6%; atempo is chained to stay within 0.5–2.0).
 - `on_message`: reads only non-bot messages in the bound channel, and only while the bot is connected to voice.
 - Text cleaning before synthesis:
   - `clean_content` (mentions become names)
@@ -115,19 +140,18 @@ Each failure is logged with its exception type, for example `edge-tts (plain) fa
 - Never run two copies with the same token (PC + cloud): both would read every message.
 - **edge-tts** uses Microsoft's undocumented Edge "Read Aloud" endpoint. It is free but unofficial, and it can break without notice. **gTTS** is the same kind of unofficial endpoint, for Google Translate.
 - **Privileged intents** (Message Content) need Discord review only once the bot reaches 10,000+ users. That is not relevant here.
-- **Privacy:** the bot reads members' messages aloud. Server members should be told that a TTS bot is active in the bound channel. Nothing is stored.
+- **Privacy:** the bot reads members' messages aloud. Server members should be told that a TTS bot is active in the bound channel. Messages and audio are never stored; only `/myvoice` preferences (user ID → voice/speed/pitch) and the `/voice` server default are saved (local file, plus MongoDB Atlas if configured).
 
 ## Ideas / possible next steps
 - Run an optional command such as `py -m edge_tts --voice th-TH-PremwadeeNeural --text "ทดสอบ" --write-media test.mp3` on the host to isolate edge-tts problems from the bot itself.
-- Add a `/speed` and `/pitch` command for each server, instead of `.env`-only settings.
 - Add an option to read only messages from members who are currently in the voice channel.
-- Add a per-user voice choice.
+- **Not yet tested live:** `/myvoice` / `/resetvoice` and the MongoDB storage (written on a PC without Python). Check that the commands appear after the global sync, that out-of-range values are rejected, and that the gTTS fallback follows each member's speed/pitch.
 - Free always-on hosting: Oracle Cloud Always Free VM (needs card verification), or a spare PC or Raspberry Pi.
 - An offline Thai TTS engine as a final fallback, if both free online services prove unreliable.
 
 ## Rules for any agent working on this repo
-- Never read, print, log or commit `.env` or the token.
-- Keep everything free. Do not introduce paid APIs.
+- Never read, print, log or commit `.env`, the token or `MONGODB_URI` (it contains the database password).
+- Keep everything free. Do not introduce paid APIs. The only secrets are the Discord token and the optional `MONGODB_URI`, a free Atlas M0 database the owner approved.
 - Keep Thai (th-TH) as the only speech language.
 - Keep the Windows one-click flow (`start.bat`) working.
 - When changing dependencies, make sure Windows wheels exist for Python 3.12.
