@@ -191,9 +191,11 @@ class TTSBot(discord.Client):
         port = os.getenv("PORT")   # set by Render and similar hosts
         if MONGODB_URI:
             await self.connect_database()
-        elif port:
-            print("WARNING: MONGODB_URI is not set, so /myvoice and /voice settings "
-                  "will be lost on every cloud redeploy")
+        else:
+            print(f"Settings: saved only in {SETTINGS_FILE} (MONGODB_URI is not set)")
+            if port:
+                print("WARNING: without MONGODB_URI, /myvoice and /voice settings "
+                      "will be lost on every cloud redeploy")
         await self.tree.sync()
         if port:
             self._health = await start_health_server(int(port))
@@ -223,8 +225,8 @@ class TTSBot(discord.Client):
             return
         self.user_settings, self.guild_settings = fresh["users"], fresh["guilds"]
         self._write_local()
-        print(f"Loaded settings from MongoDB: {len(self.user_settings)} member(s), "
-              f"{len(self.guild_settings)} server(s)")
+        print(f"Loaded settings from MongoDB (database {MONGODB_DB}): "
+              f"{len(self.user_settings)} member(s), {len(self.guild_settings)} server(s)")
 
     def set_setting(self, kind: str, key: str, doc: Optional[dict]):
         """Change one member's ("users") or server's ("guilds") settings; None removes them.
@@ -271,6 +273,7 @@ class TTSBot(discord.Client):
                     await self._db[kind].delete_one({"_id": key})
                 if store.get(key) == doc:        # not changed again while saving
                     self._pending[kind].discard(key)
+                print(f"  saved {kind[:-1]} {key} to MongoDB ({MONGODB_DB}.{kind})")
         self._write_local()
 
     async def on_ready(self):
