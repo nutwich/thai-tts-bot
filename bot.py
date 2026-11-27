@@ -337,6 +337,10 @@ def speed_pitch_filter(speed: float, pitch_hz: int, male: bool = False) -> str:
             f'{",".join(steps)}"')
 
 
+# our clips are small local MP3s: skip ffmpeg's slow input probing so
+# playback starts sooner (matters on Render's 0.1-CPU free instance)
+FFMPEG_FAST_START = "-nostdin -analyzeduration 0 -probesize 32768"
+
 MALE_FALLBACK_PITCH = 0.78  # Google fallback for "male": ~22% lower than its female voice
 
 EDGE_TIMEOUT = 3.0          # seconds to wait for Microsoft before using Google
@@ -421,7 +425,7 @@ async def player(guild: discord.Guild):
         vc = guild.voice_client
         path = None
         try:
-            path, opts, engine = await synth_task
+            path, opts, engine, synth_secs = await synth_task
             if not vc or not vc.is_connected():
                 continue
             st = getattr(vc, "_connection", None)
@@ -430,10 +434,13 @@ async def player(guild: discord.Guild):
                 if st is None or getattr(st, "dave_protocol_version", 0) == 0 or getattr(st, "can_encrypt", True):
                     break
                 await asyncio.sleep(0.1)
-            print(f"  ready in {time.monotonic() - queued_at:.1f}s via {engine}")
+            now = time.monotonic()
+            print(f"  playing {now - queued_at:.1f}s after the message "
+                  f"(voice made in {synth_secs:.1f}s via {engine})")
             done = asyncio.Event()
             vc.play(
-                discord.FFmpegPCMAudio(path, executable=FFMPEG, options=f"-vn {opts}".strip()),
+                discord.FFmpegPCMAudio(path, executable=FFMPEG, before_options=FFMPEG_FAST_START,
+                                       options=f"-vn {opts}".strip()),
                 after=lambda _e: bot.loop.call_soon_threadsafe(done.set),
             )
             await done.wait()
@@ -450,8 +457,16 @@ def enqueue(guild: discord.Guild, text: str, user_id: int | None = None):
     queue = bot.queues[guild.id]
     if queue.full():
         return  # drop spam rather than lag behind
-    task = asyncio.create_task(synthesise(text, guild.id, user_id))
+    task = asyncio.create_task(_timed_synthesise(text, guild.id, user_id))
     queue.put_nowait((task, time.monotonic()))
+
+
+async def _timed_synthesise(text: str, guild_id: int, user_id: int | None):
+    """synthesise() plus how long it took, so the log separates voice-making time
+    from time spent waiting behind the previous message."""
+    start = time.monotonic()
+    path, opts, engine = await synthesise(text, guild_id, user_id)
+    return path, opts, engine, time.monotonic() - start
 
 
 # ------------------------------------------------------------ voice / join ---

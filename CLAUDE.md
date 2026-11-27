@@ -136,7 +136,8 @@ Each failure is logged with its exception type, for example `edge-tts (plain) fa
 - **Male voice on Google:** imitated by lowering the pitch (`MALE_FALLBACK_PITCH` = 0.78 in `speed_pitch_filter`). It is clearly deeper, but not a real male voice.
 - The log shows `via microsoft (male)` / `via google (male, imitated)` / `via google (female)`.
 - **Pipelining:** synthesis starts in `enqueue()` (when the message arrives), not when the player reaches it, so the next clip is prepared while the current one plays.
-- Each message logs `ready in X.Xs via microsoft|google`.
+- Each message logs `playing X.Xs after the message (voice made in Y.Ys via <engine> (<voice>))`. X includes waiting behind the previous clip; Y is synthesis only.
+- ffmpeg gets `FFMPEG_FAST_START` (`-analyzeduration 0 -probesize 32768`), so it skips input probing on the small local MP3s.
 - The `last_clip.mp3` diagnostic copy was removed.
 
 ## Constraints and caveats
