@@ -78,6 +78,7 @@ PORT=                   # set by Render: starts an aiohttp /health endpoint for 
     - If MongoDB is unreachable, the local copy is used and saving is retried.
   - Error text goes through `_safe_err()`, so the URI (which contains the password) is never logged.
   - On Render without `MONGODB_URI`, a warning is logged.
+  - `SSL handshake failed ... TLSV1_ALERT_INTERNAL_ERROR` from `*.mongodb.net` means Atlas **Network Access** does not allow the caller's IP. Render IPs change, so the fix is to allow `0.0.0.0/0`. Seen on Render on 27 Nov 2026.
 - `voice_params()` resolves voice/speed/pitch per message: member setting → server `/voice` → `.env` defaults. edge-tts gets `rate=f"{(speed-1)*100:+d}%"`, `pitch=f"{pitch:+d}Hz"`; the gTTS fallback uses `speed_pitch_filter(speed, pitch)` (pitch ratio `1 + Hz/250`, so +15 Hz ≈ 6%; atempo is chained to stay within 0.5–2.0).
 - `on_message`: reads only non-bot messages in the bound channel, and only while the bot is connected to voice.
 - Text cleaning before synthesis:
@@ -136,7 +137,7 @@ Each failure is logged with its exception type, for example `edge-tts (plain) fa
 - The `last_clip.mp3` diagnostic copy was removed.
 
 ## Constraints and caveats
-- **Uptime:** on Windows the bot is online only while the host PC is on and `start.bat` is open. Render free hosting is prepared but **not yet verified** — open risks: Render may block outbound UDP (voice), shared IPs can get Discord `429` blocks, and the free instance sleeps after 15 min without inbound HTTP (hence the cron ping to `/health`). Cloudflare Workers / Vercel cannot host this bot (no persistent process, no UDP); Railway / Fly.io have no usable free tier.
+- **Uptime:** on Windows the bot is online only while the host PC is on and `start.bat` is open. **Render free hosting works** (verified 27 Nov 2026, service `thai-tts-bot.onrender.com`, Singapore). Voice connects and plays; the owner hears speed/voice changes. Remaining risks: shared IPs can get Discord `429` blocks, and the free instance sleeps after 15 min without inbound HTTP (hence the cron ping to `/health`). Cloudflare Workers / Vercel cannot host this bot (no persistent process, no UDP); Railway / Fly.io have no usable free tier.
 - Never run two copies with the same token (PC + cloud): both would read every message.
 - **edge-tts** uses Microsoft's undocumented Edge "Read Aloud" endpoint. It is free but unofficial, and it can break without notice. **gTTS** is the same kind of unofficial endpoint, for Google Translate.
 - **Privileged intents** (Message Content) need Discord review only once the bot reaches 10,000+ users. That is not relevant here.

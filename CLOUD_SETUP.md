@@ -2,7 +2,7 @@
 
 บอทออนไลน์โดยไม่ต้องเปิดคอม ไม่ต้องใช้บัตร ใช้เวลาตั้งค่าประมาณ 15 นาที
 
-> ⚠️ **ยังไม่ได้ทดสอบเสียงบน Render จริง** ถ้าบอทเข้าห้องได้แต่ไม่มีเสียง แปลว่า Render ไม่ยอมให้ส่งเสียง (UDP) → ไปใช้ [เครื่อง Linux](#ทางเลือก-เครื่อง-linux-google-cloud--คอมเก่า) แทน
+> ✅ ทดสอบแล้ว (27 พ.ย. 2026): บอทบน Render เข้าห้องเสียงและพูดได้ปกติ
 
 ## 1. สร้างบอทบน Render
 1. ต้อง push โค้ดล่าสุดขึ้น GitHub ก่อน (repo เป็น private ได้)
@@ -68,6 +68,7 @@ push ขึ้น GitHub branch `main` → Render build ใหม่ให้อ
 - **Logs ขึ้น `429` / `You are being blocked`** → IP ของ Render ใช้ร่วมกับคนอื่นแล้วโดน Discord บล็อกชั่วคราว ลองกด **Manual Deploy → Restart** ให้ได้เครื่องใหม่ หรือรอสักพัก
 - **บอทหลุดบ่อย** → เช็กใน cron-job.org ว่ายังยิงผ่าน (`200 OK`) อยู่ไหม
 - **Logs ขึ้น `Microsoft voice unavailable`** → บอทสลับไปใช้เสียง Google ให้เอง ยังใช้ได้
+- **Logs ขึ้น `SSL handshake failed ... TLSV1_ALERT_INTERNAL_ERROR`** (MongoDB) → Atlas ไม่ยอมให้ IP ของ Render เข้า ไปที่ Atlas → **Network Access** → **Add IP Address** → **Allow access from anywhere** (`0.0.0.0/0`) รอจนสถานะเป็น **Active** บอทจะลองบันทึกใหม่เองภายในไม่กี่นาที
 - การใช้ cron ปลุกเป็นช่องที่ Render อาจปิดในอนาคต ถ้าวันนึงใช้ไม่ได้ ไปใช้เครื่อง Linux แทน
 
 ---
