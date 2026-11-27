@@ -319,10 +319,11 @@ def voice_params(guild_id: int, user_id: int | None) -> tuple[str, float, int]:
     return gender, speed, pitch
 
 
-def speed_pitch_filter(speed: float, pitch_hz: int) -> str:
+def speed_pitch_filter(speed: float, pitch_hz: int, male: bool = False) -> str:
     """ffmpeg filter used when the engine itself cannot change speed/pitch.
-    +15 Hz ~ 6% higher (asetrate 50880), like edge-tts' pitch shift."""
-    ratio = _clamp(1 + pitch_hz / 250, 0.8, 1.25)
+    +15 Hz ~ 6% higher (asetrate 50880), like edge-tts' pitch shift.
+    Google has only a female Thai voice, so "male" is imitated by a lower pitch."""
+    ratio = _clamp(1 + pitch_hz / 250, 0.8, 1.25) * (MALE_FALLBACK_PITCH if male else 1.0)
     tempo = speed / ratio
     steps = []
     while tempo > 2.0:      # older ffmpeg builds accept atempo 0.5..2.0 only
@@ -336,9 +337,13 @@ def speed_pitch_filter(speed: float, pitch_hz: int) -> str:
             f'{",".join(steps)}"')
 
 
+MALE_FALLBACK_PITCH = 0.78  # Google fallback for "male": ~22% lower than its female voice
+
 EDGE_TIMEOUT = 3.0          # seconds to wait for Microsoft before using Google
-EDGE_COOLDOWN = 600         # skip Microsoft for 10 min after it fails
+EDGE_FAILS_TO_SKIP = 2      # one slow answer (e.g. just after a cold start) is not enough
+EDGE_COOLDOWN = 120         # then skip Microsoft for 2 min (Google cannot do the male voice)
 _edge_disabled_until = 0.0
+_edge_fails = 0
 
 
 def _tmp_mp3() -> str:
@@ -379,26 +384,34 @@ def _safe_remove(path):
 
 
 async def synthesise(text: str, guild_id: int, user_id: int | None = None) -> tuple[str, str, str]:
-    """Returns (mp3 path, extra ffmpeg options, engine name)."""
-    global _edge_disabled_until
+    """Returns (mp3 path, extra ffmpeg options, engine label for the log)."""
+    global _edge_disabled_until, _edge_fails
     gender, speed, pitch = voice_params(guild_id, user_id)
     voice = VOICES[gender]
-    fallback_filter = speed_pitch_filter(speed, pitch)
+    fallback_filter = speed_pitch_filter(speed, pitch, male=(gender == "male"))
+    google_label = "google (male, imitated)" if gender == "male" else "google (female)"
 
     if time.monotonic() < _edge_disabled_until:
-        return await _google(text), fallback_filter, "google"
+        return await _google(text), fallback_filter, google_label
 
     # ask both at the same time; prefer Microsoft if it answers quickly
     google_task = asyncio.create_task(_google(text))
     try:
         path = await asyncio.wait_for(_edge(text, voice, speed, pitch), timeout=EDGE_TIMEOUT)
+        _edge_fails = 0
         google_task.add_done_callback(
             lambda t: _safe_remove(t.result()) if not t.cancelled() and not t.exception() else None)
-        return path, "", "microsoft"
+        return path, "", f"microsoft ({gender})"
     except Exception as e:
-        _edge_disabled_until = time.monotonic() + EDGE_COOLDOWN
-        print(f"  Microsoft voice unavailable ({type(e).__name__}); using Google for the next 10 min")
-        return await google_task, fallback_filter, "google"
+        _edge_fails += 1
+        if _edge_fails >= EDGE_FAILS_TO_SKIP:
+            _edge_fails = 0
+            _edge_disabled_until = time.monotonic() + EDGE_COOLDOWN
+            print(f"  Microsoft voice unavailable ({type(e).__name__}); "
+                  f"using Google for the next {EDGE_COOLDOWN // 60} min")
+        else:
+            print(f"  Microsoft voice slow/failed once ({type(e).__name__}); Google for this message")
+        return await google_task, fallback_filter, google_label
 
 
 async def player(guild: discord.Guild):

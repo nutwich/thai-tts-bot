@@ -131,7 +131,10 @@ Each failure is logged with its exception type, for example `edge-tts (plain) fa
 
 ## Latency optimisation (added after 5–7 s delays)
 - `synthesise()` now **races** edge-tts (3 s timeout) against gTTS. If Microsoft answers in time it is used; otherwise the already-running Google request is used.
-- **Circuit breaker:** after one Microsoft failure, Microsoft is skipped for 10 minutes (`EDGE_COOLDOWN`), so the bot goes straight to Google.
+- **Circuit breaker:** after **2 consecutive** Microsoft failures (`EDGE_FAILS_TO_SKIP`), Microsoft is skipped for **2 minutes** (`EDGE_COOLDOWN`), so the bot goes straight to Google. It was 1 failure → 10 min.
+  - The owner reported that male/female did not switch. Google has only a female Thai voice, and one cold-start timeout on Render had locked everyone onto Google for 10 minutes.
+- **Male voice on Google:** imitated by lowering the pitch (`MALE_FALLBACK_PITCH` = 0.78 in `speed_pitch_filter`). It is clearly deeper, but not a real male voice.
+- The log shows `via microsoft (male)` / `via google (male, imitated)` / `via google (female)`.
 - **Pipelining:** synthesis starts in `enqueue()` (when the message arrives), not when the player reaches it, so the next clip is prepared while the current one plays.
 - Each message logs `ready in X.Xs via microsoft|google`.
 - The `last_clip.mp3` diagnostic copy was removed.
