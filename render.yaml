@@ -26,3 +26,7 @@ services:
         sync: false        # optional: extra text channel that can summon the bot
       - key: MONGODB_URI
         sync: false        # secret: MongoDB Atlas connection string (see CLOUD_SETUP.md step 5)
+      - key: GOOGLE_TTS_API_KEY
+        sync: false        # secret: Google Cloud TTS key (optional, free quota only; see CLOUD_SETUP.md step 6)
+      - key: GOOGLE_TTS_MONTHLY_LIMIT
+        value: "800000"    # free tier is 1,000,000/month for Chirp 3 HD; stop early to be safe

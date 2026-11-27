@@ -4,3 +4,4 @@
 __pycache__/
 *.mp3
 user_settings.json
+gcloud_usage.json

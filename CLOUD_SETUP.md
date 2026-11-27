@@ -12,6 +12,7 @@
    - **DISCORD_TOKEN** → วาง token บอท (ใส่ตรงนี้ที่เดียว ห้ามใส่ในไฟล์ใน GitHub)
    - **READ_CHANNEL_ID** → เว้นว่างได้ (ดูข้อ 4)
    - **MONGODB_URI** → ลิงก์ฐานข้อมูล MongoDB (ดูข้อ 5) ถ้าไม่ใส่ ค่า /myvoice และ /voice จะหายทุกครั้งที่ Render build ใหม่
+   - **GOOGLE_TTS_API_KEY** → เว้นว่างได้ (ดูข้อ 6: เสียง Google Cloud ในโควตาฟรี)
 5. กด **Apply** รอ build ประมาณ 3–5 นาที
 6. เปิดหน้า service → แท็บ **Logs** ถ้าเห็น `Logged in as บอทท่านจิน#2654` = ออนไลน์แล้ว
 7. จดลิงก์ของบอทที่มุมบนซ้าย เช่น `https://thai-tts-bot-xxxx.onrender.com`
@@ -57,6 +58,29 @@ Render ฟรีจะล้างไฟล์ทุกครั้งที่ 
 
 - ใส่ลิงก์เดียวกันทั้งคอมและ Render ได้ ย้ายไปมาค่าก็ตามไป (แต่อย่ารันบอท 2 ที่พร้อมกัน)
 - ถ้า MongoDB ล่มชั่วคราว บอทใช้ไฟล์ในเครื่องต่อ แล้วบันทึกขึ้นฐานข้อมูลให้เองเมื่อต่อได้
+
+## 6. (ไม่บังคับ) เสียง Google Cloud เป็นเสียงหลัก — เฉพาะโควตาฟรี
+เสียง Chirp 3 HD ของ Google Cloud มีเสียงผู้ชาย/ผู้หญิงจริง และไม่ล่มแบบ Microsoft ฟรีเดือนละ **1,000,000 ตัวอักษร**
+บอทจะนับตัวอักษรเอง พอถึง **800,000** (ตั้งได้ที่ `GOOGLE_TTS_MONTHLY_LIMIT`) จะเปลี่ยนไปใช้ Microsoft ฟรี → Google Translate เองจนถึงเดือนหน้า
+
+> ⚠️ Google **ไม่หยุดให้เอง** เมื่อหมดโควตาฟรี แต่จะตัดบัตร บอทเลยต้องนับเอง และต้องมี **MONGODB_URI** (ข้อ 5) ตัวนับจะได้ไม่รีเซ็ตตอน Render build ใหม่ ถ้าบอทอ่านตัวนับไม่ได้ บอทจะไม่ใช้ Google Cloud เลย (กันโดนเก็บเงิน)
+
+1. ไปที่ https://console.cloud.google.com → สร้าง **New Project** (เช่น `thai-tts-bot`)
+2. **Billing** → ผูกบัตร (Google บังคับ แม้ใช้แต่ของฟรี)
+3. ค้นหา **Cloud Text-to-Speech API** → กด **Enable**
+4. **APIs & Services → Credentials → Create credentials → API key**
+   - กด **Edit API key** → **API restrictions** → เลือก **Restrict key** → ติ๊กแค่ **Cloud Text-to-Speech API** → Save
+5. ตั้งกันพลาดอีกชั้น: **Billing → Budgets & alerts → Create budget** → จำนวน **$1** → แจ้งเตือนอีเมลที่ 50% / 100%
+   (Google ยังไม่หยุดเองนะ แค่ส่งเมลเตือน ถ้าได้เมลนี้ให้ลบ `GOOGLE_TTS_API_KEY` ออกจาก Render ทันที)
+6. ใส่ key ใน `GOOGLE_TTS_API_KEY` (Render: **Environment** / คอม: `.env`)
+7. เปิดบอทใหม่ ถ้า Logs ขึ้น `Google Cloud TTS: on, 0 / 800,000 characters used in ...` = ใช้ได้
+   ข้อความจะขึ้นว่า `via google-cloud (male)` หรือ `(female)`
+
+> 🔒 API key เป็นความลับเหมือน token บอท ถ้าหลุด → Credentials → ลบ key แล้วสร้างใหม่
+
+- เปลี่ยนเสียงได้ที่ `GOOGLE_TTS_FEMALE` / `GOOGLE_TTS_MALE` (ชื่อเสียงดูได้ที่หน้า voices ของ Google Cloud เลือก Thai + Chirp3-HD)
+- ดูว่าใช้ไปเท่าไหร่: Atlas → `thai_tts_bot` → `usage`
+- ปิดใช้ Google Cloud: ลบ `GOOGLE_TTS_API_KEY` ออก → บอทกลับไปใช้แต่เสียงฟรี
 
 แก้ค่าทีหลังได้ที่ Render: หน้า service → **Environment** → แก้ → **Save Changes** (บอทรีสตาร์ทเอง)
 

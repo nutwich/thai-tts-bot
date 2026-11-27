@@ -3,7 +3,9 @@
 ## Purpose
 A free text-to-speech Discord bot that reads chat messages aloud **in Thai only** (th-TH) in a voice channel, at **1.5x speed** and **slightly higher pitch**, without reading the sender's name. It runs on a friend's Discord server ("Jin's server") and is self-hosted on the owner's Windows PC.
 
-Hard requirement: **100% free**. No paid APIs, no paid hosting, no API keys apart from the Discord bot token.
+Hard requirement: **no cost**. Nothing may ever produce a bill.
+- The only exceptions, approved by the owner, are free tiers that need a key: MongoDB Atlas M0, and Google Cloud TTS **within its free monthly quota**.
+- The bot enforces the Google Cloud quota itself. Google does not stop at the free quota; it charges the card.
 
 ## Current status (23 Nov 2026)
 - The bot application exists on the Discord Developer Portal as **"บอทท่านจิน"** (originally "Thai TTS"; bot user `บอทท่านจิน#2654`) (Application ID `1574447505498841338`, Public Bot = on).
@@ -19,8 +21,9 @@ Hard requirement: **100% free**. No paid APIs, no paid hosting, no API keys apar
 | Language | Python 3.12 (Windows, per-user install via winget) | Prebuilt Windows wheels exist for every dependency, including `davey` |
 | Discord library | `discord.py[voice]` >= 2.7.1 | 2.7 added **DAVE** support; Discord has required DAVE E2EE for all non-stage voice connections since **1 Mar 2026**, so older libraries cannot join voice |
 | E2EE | `davey==0.1.7` (**pinned**) | DAVE protocol implementation; 0.2.0 left the session `ready=False` with discord.py 2.7.1 |
-| TTS, primary | `edge-tts` → `th-TH-PremwadeeNeural` (female, default) / `th-TH-NiwatNeural` (male) | Free Microsoft Edge neural voices, with native `rate` / `pitch` support |
-| TTS, fallback | `gTTS` (Google Translate, `lang="th"`) | Free; used only if edge-tts fails twice |
+| TTS, first (optional) | Google Cloud TTS REST (`aiohttp`), Chirp 3 HD `th-TH-Chirp3-HD-Kore` (female) / `-Charon` (male) | The owner wanted it as the main voice. Used **only within the free quota**, counted by the bot |
+| TTS, free | `edge-tts` → `th-TH-PremwadeeNeural` (female, default) / `th-TH-NiwatNeural` (male) | Free Microsoft Edge neural voices, with native `rate` / `pitch` support. Unofficial, so it sometimes fails with `NoAudioReceived` |
+| TTS, last | `gTTS` (Google Translate, `lang="th"`) | Free and fast (~0.1 s). Has a female voice only |
 | Audio | `imageio-ffmpeg` (bundled ffmpeg binary) | No manual ffmpeg install on Windows |
 | Config | `python-dotenv` → `.env` | Keeps the token out of the code |
 | Settings DB | `pymongo>=4.13` → MongoDB Atlas M0 (optional, via `MONGODB_URI`) | Free forever with no card; the owner chose it so `/myvoice` and `/voice` survive cloud redeploys across all servers |
@@ -51,6 +54,10 @@ PITCH_MIN=-20           # /myvoice pitch limits (Hz)
 PITCH_MAX=40
 MONGODB_URI=            # SECRET: MongoDB Atlas (free M0) connection string, contains the DB password
 MONGODB_DB=             # optional database name, default thai_tts_bot
+GOOGLE_TTS_API_KEY=     # SECRET, optional: Google Cloud TTS first (free quota only)
+GOOGLE_TTS_MONTHLY_LIMIT=800000   # stop using Google Cloud after this many characters per month
+GOOGLE_TTS_FEMALE=th-TH-Chirp3-HD-Kore
+GOOGLE_TTS_MALE=th-TH-Chirp3-HD-Charon
 PORT=                   # set by Render: starts an aiohttp /health endpoint for cron pings
 ```
 
@@ -100,16 +107,28 @@ PORT=                   # set by Render: starts an aiohttp /health endpoint for 
   - `/join` and auto-join share `_connect()` behind a per-guild `asyncio.Lock`, so simultaneous messages connect once.
 - On Linux, `_check_opus()` loads `libopus.so.0` (warns if missing), and ffmpeg falls back to the system binary if the `imageio-ffmpeg` one is unavailable.
 
-## TTS fallback chain (`synthesise()`)
-1. edge-tts with `rate=RATE, pitch=PITCH`, so no ffmpeg filter is needed.
-2. edge-tts plain, with speed and pitch applied by ffmpeg.
-3. gTTS Thai, with speed and pitch applied by ffmpeg.
+## TTS chain (`synthesise()`)
+1. **Google Cloud TTS** (only if `GOOGLE_TTS_API_KEY` is set and `bot.gcloud_reserve(len(text))` allows it), with a 3 s timeout.
+   - It produces real male and female voices. Speed and pitch are applied by ffmpeg (`speed_pitch_filter`).
+   - HTTP 400 (bad text) falls back for that message only. Any other error turns Google Cloud off for 5 min (`GCLOUD_COOLDOWN`).
+   - The key is sent in the `X-Goog-Api-Key` header, never in the URL.
+2. **edge-tts** with native `rate`/`pitch`, raced against gTTS. Microsoft wins if it answers within `EDGE_TIMEOUT`.
+3. **gTTS**, with speed and pitch applied by ffmpeg. The male voice is imitated with a lower pitch.
 
-The ffmpeg filter for steps 2 and 3:
-`-af "aresample=48000,asetrate=50880,aresample=48000,atempo=<speed/1.06>"`, where speed is derived from `TTS_RATE`.
-This raises pitch by about 6%. At +50% the overall speed is 1.5x. Verified: a 2.0 s input becomes 1.34 s of output.
+Log labels: `google-cloud (male)`, `microsoft (female)`, `google-translate (male, imitated)`.
 
-Each failure is logged with its exception type, for example `edge-tts (plain) failed: NoAudioReceived: ...`.
+**Google Cloud free-quota guard** (Chirp 3 HD: 1,000,000 characters free per month, then about $30 per 1M; Google bills automatically):
+- `gcloud_reserve()` counts `len(text)` **before** each request.
+- When `GOOGLE_TTS_MONTHLY_LIMIT` (default 800,000) would be passed, the bot logs once and uses the free voices until the next billing month. `_billing_month()` uses UTC-8 to match Google's Pacific-time month.
+- The count is stored in MongoDB `usage` (`_id: "gcloud-tts-YYYY-MM"`, `$inc` from `_gcloud_usage_worker`) so it survives Render redeploys. Without `MONGODB_URI` it is stored in `gcloud_usage.json` (git- and docker-ignored).
+- **If the count cannot be read at start, Google Cloud is not used.** The bot retries the read every 2 min. An unknown count could mean a bill.
+- The startup log shows `Google Cloud TTS: on, X / LIMIT characters used in YYYY-MM`.
+- Open question: whether Google counts Thai characters exactly as Python `len()` does (combining vowel and tone marks). The 20% margin covers small differences. The owner should also set a Google Cloud **budget alert** as a second guard.
+
+The ffmpeg filter (`speed_pitch_filter`) is `aresample=48000,asetrate=48000*ratio,aresample=48000,atempo=speed/ratio`.
+- `ratio = 1 + pitch_hz/250`, so +15 Hz ≈ 6%.
+- For imitated male on gTTS, `ratio` is also multiplied by 0.78.
+- atempo is chained to stay within 0.5–2.0.
 
 ## Problems met and how they were handled
 1. **DAVE / E2EE requirement.** Voice failing to connect is avoided by using discord.py >= 2.7.1 with `davey`. Confirmed: the handshake completes.
@@ -156,7 +175,10 @@ Each failure is logged with its exception type, for example `edge-tts (plain) fa
 
 ## Rules for any agent working on this repo
 - Never read, print, log or commit `.env`, the token or `MONGODB_URI` (it contains the database password).
-- Keep everything free. Do not introduce paid APIs. The only secrets are the Discord token and the optional `MONGODB_URI`, a free Atlas M0 database the owner approved.
+- Never read, print, log or commit `GOOGLE_TTS_API_KEY`.
+- Nothing may ever cost money. Do not introduce paid APIs.
+- The only secrets are the Discord token, `MONGODB_URI` (free Atlas M0) and `GOOGLE_TTS_API_KEY` (Google Cloud TTS, free quota only). The owner approved all three.
+- Never weaken the Google Cloud quota guard. In particular, never use Google Cloud when the usage count is unknown.
 - Keep Thai (th-TH) as the only speech language.
 - Keep the Windows one-click flow (`start.bat`) working.
 - When changing dependencies, make sure Windows wheels exist for Python 3.12.

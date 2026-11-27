@@ -7,6 +7,7 @@ Thai TTS Discord bot (th-TH only)
 """
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import time
 import tempfile
 from typing import Optional
 
+import aiohttp            # installed with discord.py
 import discord
 import edge_tts
 import imageio_ffmpeg
@@ -186,6 +188,15 @@ class TTSBot(discord.Client):
         self.auto_paused: set[int] = set()       # guilds where /leave was used
         self.connect_locks: dict[int, asyncio.Lock] = {}
         self._health = None
+        # Google Cloud TTS free-quota counter (characters this billing month)
+        self.gc_session: Optional[aiohttp.ClientSession] = None
+        self.gc_month = ""
+        self.gc_used: Optional[int] = None       # None = unknown -> do not use Google Cloud
+        self.gc_unsynced: dict[str, int] = {}    # month -> characters not yet added in MongoDB
+        self.gc_disabled_until = 0.0
+        self.gc_limit_logged = ""
+        self._gc_task: Optional[asyncio.Task] = None        # saves the count to MongoDB
+        self._gc_retry_task: Optional[asyncio.Task] = None  # re-reads the count after a failure
 
     async def setup_hook(self):
         port = os.getenv("PORT")   # set by Render and similar hosts
@@ -196,6 +207,12 @@ class TTSBot(discord.Client):
             if port:
                 print("WARNING: without MONGODB_URI, /myvoice and /voice settings "
                       "will be lost on every cloud redeploy")
+        if GCLOUD_KEY:
+            self.gc_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=GCLOUD_TIMEOUT + 2))
+            if not await self.load_gcloud_usage():
+                self._gc_retry_task = asyncio.create_task(self._retry_gcloud_usage())
+        else:
+            print("Google Cloud TTS: off (GOOGLE_TTS_API_KEY is not set), using the free voices")
         await self.tree.sync()
         if port:
             self._health = await start_health_server(int(port))
@@ -276,6 +293,85 @@ class TTSBot(discord.Client):
                 print(f"  saved {kind[:-1]} {key} to MongoDB ({MONGODB_DB}.{kind})")
         self._write_local()
 
+    # ----- Google Cloud TTS free-quota counter -----
+    # Kept in MongoDB (collection "usage", _id "gcloud-tts-YYYY-MM", atomic $inc) so it
+    # survives redeploys; in gcloud_usage.json when there is no database. If the count
+    # cannot be read, Google Cloud is not used at all: an unknown count could mean a bill.
+    async def load_gcloud_usage(self) -> bool:
+        month = _billing_month()
+        try:
+            if MONGODB_URI:
+                if self._db is None:
+                    raise RuntimeError("MongoDB is not connected")
+                doc = await self._db.usage.find_one({"_id": f"gcloud-tts-{month}"})
+                used = int(doc["chars"]) if doc else 0
+            else:
+                try:
+                    with open(GCLOUD_USAGE_FILE, encoding="utf-8") as f:
+                        data = json.load(f)
+                    used = int(data.get("chars", 0)) if data.get("month") == month else 0
+                except FileNotFoundError:
+                    used = 0
+        except Exception as e:
+            print(f"WARNING: could not read the Google Cloud TTS usage count ({_safe_err(e)}); "
+                  "using the free voices until it can be read")
+            return False
+        self.gc_month, self.gc_used = month, used
+        print(f"Google Cloud TTS: on, {used:,} / {GCLOUD_MONTHLY_LIMIT:,} characters used in {month}")
+        return True
+
+    async def _retry_gcloud_usage(self):
+        while self.gc_used is None:
+            await asyncio.sleep(120)
+            await self.load_gcloud_usage()
+
+    def gcloud_reserve(self, n: int) -> bool:
+        """Count n characters against this month's quota before calling Google Cloud.
+        False = do not use it (no key, count unknown, over the limit, or cooling down)."""
+        if (not GCLOUD_KEY or self.gc_used is None or self.gc_session is None
+                or time.monotonic() < self.gc_disabled_until):
+            return False
+        month = _billing_month()
+        if month != self.gc_month:              # new month: the free quota starts again
+            self.gc_month, self.gc_used = month, 0
+        if self.gc_used + n > GCLOUD_MONTHLY_LIMIT:
+            if self.gc_limit_logged != month:
+                self.gc_limit_logged = month
+                print(f"Google Cloud TTS: free quota for {month} used up "
+                      f"({self.gc_used:,} characters); free voices until next month")
+            return False
+        self.gc_used += n
+        self.gc_unsynced[month] = self.gc_unsynced.get(month, 0) + n
+        self._save_gcloud_usage()
+        return True
+
+    def _save_gcloud_usage(self):
+        if not MONGODB_URI:
+            try:
+                with open(GCLOUD_USAGE_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"month": self.gc_month, "chars": self.gc_used}, f)
+                self.gc_unsynced.clear()
+            except OSError as e:
+                print(f"WARNING: could not save Google Cloud TTS usage: {e}")
+            return
+        if self._gc_task is None or self._gc_task.done():
+            self._gc_task = asyncio.create_task(self._gcloud_usage_worker())
+
+    async def _gcloud_usage_worker(self):
+        failures = 0
+        while any(self.gc_unsynced.values()):
+            await asyncio.sleep(2 if failures == 0 else min(300, 30 * failures))
+            try:
+                for month, n in list(self.gc_unsynced.items()):
+                    if n:
+                        await self._db.usage.update_one(
+                            {"_id": f"gcloud-tts-{month}"}, {"$inc": {"chars": n}}, upsert=True)
+                        self.gc_unsynced[month] -= n
+                failures = 0
+            except Exception as e:
+                failures += 1
+                print(f"WARNING: saving Google Cloud TTS usage failed ({_safe_err(e)}); will retry")
+
     async def on_ready(self):
         print(f"Logged in as {self.user} | servers: {len(self.guilds)}")
 
@@ -349,6 +445,55 @@ EDGE_COOLDOWN = 120         # then skip Microsoft for 2 min (Google cannot do th
 _edge_disabled_until = 0.0
 _edge_fails = 0
 
+# --------------------------------------------- Google Cloud TTS (free quota only) ---
+# First choice when GOOGLE_TTS_API_KEY is set. Google does NOT stop at the free quota,
+# it bills the card, so the bot counts every character itself and switches to the free
+# voices (Microsoft Edge -> Google Translate) once GOOGLE_TTS_MONTHLY_LIMIT is reached.
+GCLOUD_KEY = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
+GCLOUD_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+GCLOUD_VOICES = {
+    "female": os.getenv("GOOGLE_TTS_FEMALE", "").strip() or "th-TH-Chirp3-HD-Kore",
+    "male": os.getenv("GOOGLE_TTS_MALE", "").strip() or "th-TH-Chirp3-HD-Charon",
+}
+# Chirp 3 HD: 1,000,000 characters free per month. Stop well before that.
+GCLOUD_MONTHLY_LIMIT = _env_num("GOOGLE_TTS_MONTHLY_LIMIT", 800_000, int)
+GCLOUD_TIMEOUT = 3.0        # seconds before giving up and using the free voices
+GCLOUD_COOLDOWN = 300       # after an error, use the free voices for 5 min
+GCLOUD_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gcloud_usage.json")
+
+
+def _billing_month() -> str:
+    """Google's billing month runs on Pacific time (UTC-8; an hour off in summer)."""
+    return time.strftime("%Y-%m", time.gmtime(time.time() - 8 * 3600))
+
+
+class GCloudError(Exception):
+    def __init__(self, msg: str, status: int = 0):
+        super().__init__(msg)
+        self.status = status
+
+
+async def _gcloud(text: str, gender: str) -> str:
+    body = {
+        "input": {"text": text},
+        "voice": {"languageCode": "th-TH", "name": GCLOUD_VOICES[gender]},
+        "audioConfig": {"audioEncoding": "MP3"},
+    }
+    # key in a header, not the URL, so it can never show up in an error message
+    async with bot.gc_session.post(GCLOUD_URL, json=body,
+                                   headers={"X-Goog-Api-Key": GCLOUD_KEY}) as r:
+        data = await r.json(content_type=None)
+        if r.status != 200:
+            msg = (data.get("error") or {}).get("message", "") if isinstance(data, dict) else ""
+            raise GCloudError(f"HTTP {r.status}: {msg[:200]}", r.status)
+    audio = base64.b64decode(data["audioContent"])
+    if not audio:
+        raise GCloudError("empty audio")
+    path = _tmp_mp3()
+    with open(path, "wb") as f:
+        f.write(audio)
+    return path
+
 
 def _tmp_mp3() -> str:
     fd, path = tempfile.mkstemp(suffix=".mp3")
@@ -393,8 +538,23 @@ async def synthesise(text: str, guild_id: int, user_id: int | None = None) -> tu
     gender, speed, pitch = voice_params(guild_id, user_id)
     voice = VOICES[gender]
     fallback_filter = speed_pitch_filter(speed, pitch, male=(gender == "male"))
-    google_label = "google (male, imitated)" if gender == "male" else "google (female)"
+    google_label = "google-translate (male, imitated)" if gender == "male" else "google-translate (female)"
 
+    # 1) Google Cloud TTS, only while this month's free quota lasts
+    if bot.gcloud_reserve(len(text)):
+        try:
+            path = await asyncio.wait_for(_gcloud(text, gender), timeout=GCLOUD_TIMEOUT)
+            # real male and female voices: ffmpeg only applies speed and pitch
+            return path, speed_pitch_filter(speed, pitch), f"google-cloud ({gender})"
+        except Exception as e:
+            if isinstance(e, GCloudError) and e.status == 400:   # this text only (e.g. nothing speakable)
+                print(f"  Google Cloud TTS rejected this message ({e}); free voice for it")
+            else:   # key/quota/network problem: stop trying for a while
+                bot.gc_disabled_until = time.monotonic() + GCLOUD_COOLDOWN
+                print(f"  Google Cloud TTS failed ({type(e).__name__}: {str(e)[:200]}); "
+                      f"free voices for {GCLOUD_COOLDOWN // 60} min")
+
+    # 2) free: Microsoft Edge, raced against 3) Google Translate
     if time.monotonic() < _edge_disabled_until:
         return await _google(text), fallback_filter, google_label
 
@@ -594,8 +754,8 @@ async def skip(interaction: discord.Interaction):
 
 @bot.tree.command(name="voice", description="เลือกเสียงผู้หญิงหรือผู้ชาย")
 @app_commands.choices(gender=[
-    app_commands.Choice(name="ผู้หญิง (Premwadee)", value="female"),
-    app_commands.Choice(name="ผู้ชาย (Niwat)", value="male"),
+    app_commands.Choice(name="ผู้หญิง", value="female"),
+    app_commands.Choice(name="ผู้ชาย", value="male"),
 ])
 async def voice(interaction: discord.Interaction, gender: app_commands.Choice[str]):
     bot.set_setting("guilds", str(interaction.guild.id), {"voice": gender.value})
@@ -624,8 +784,8 @@ def describe_settings(guild_id: int, user_id: int) -> str:
     pitch=f"ระดับเสียง {PITCH_MIN:+d} ถึง {PITCH_MAX:+d} (0 = ปกติ, มาก = เสียงสูง)",
 )
 @app_commands.choices(voice=[
-    app_commands.Choice(name="ผู้หญิง (Premwadee)", value="female"),
-    app_commands.Choice(name="ผู้ชาย (Niwat)", value="male"),
+    app_commands.Choice(name="ผู้หญิง", value="female"),
+    app_commands.Choice(name="ผู้ชาย", value="male"),
 ])
 async def myvoice(
     interaction: discord.Interaction,
