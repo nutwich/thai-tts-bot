@@ -74,11 +74,13 @@ Render ฟรีจะล้างไฟล์ทุกครั้งที่ 
    (Google ยังไม่หยุดเองนะ แค่ส่งเมลเตือน ถ้าได้เมลนี้ให้ลบ `GOOGLE_TTS_API_KEY` ออกจาก Render ทันที)
 6. ใส่ key ใน `GOOGLE_TTS_API_KEY` (Render: **Environment** / คอม: `.env`)
 7. เปิดบอทใหม่ ถ้า Logs ขึ้น `Google Cloud TTS: on, 0 / 800,000 characters used in ...` = ใช้ได้
-   ข้อความจะขึ้นว่า `via google-cloud (male)` หรือ `(female)`
+   ข้อความจะขึ้นว่า `via google-cloud (Kore, female)` หรือ `(Charon, male)`
 
 > 🔒 API key เป็นความลับเหมือน token บอท ถ้าหลุด → Credentials → ลบ key แล้วสร้างใหม่
 
-- เปลี่ยนเสียงได้ที่ `GOOGLE_TTS_FEMALE` / `GOOGLE_TTS_MALE` (ชื่อเสียงดูได้ที่หน้า voices ของ Google Cloud เลือก Thai + Chirp3-HD)
+- แต่ละคนเลือกเสียง Google เองได้ใน `/myvoice` (พิมพ์ชื่อในช่อง voice แล้วเลือกจากรายการ เช่น `Puck · ผู้ชาย`) ถ้าโควตาหมด บอทจะใช้เสียงฟรีเพศเดียวกันแทน
+- Logs ตอนเปิดบอทจะบอกว่ามีเสียงไทยกี่เสียง เช่น `Google Cloud TTS: 30 Thai voices (... female, ... male)`
+- เสียงเริ่มต้น (ตอนเลือกแค่ ผู้หญิง/ผู้ชาย) เปลี่ยนได้ที่ `GOOGLE_TTS_FEMALE` / `GOOGLE_TTS_MALE`
 - ดูว่าใช้ไปเท่าไหร่: Atlas → `thai_tts_bot` → `usage`
 - ปิดใช้ Google Cloud: ลบ `GOOGLE_TTS_API_KEY` ออก → บอทกลับไปใช้แต่เสียงฟรี
 

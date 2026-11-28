@@ -120,8 +120,9 @@ intents.voice_states = True
 
 
 # --------------------------------------------------------- settings storage ---
-# "users":  user_id  -> {"voice", "speed", "pitch"}   (/myvoice, same in every server)
-# "guilds": guild_id -> {"voice"}                      (/voice server default)
+# "users":  user_id  -> {"voice", "gvoice"?, "speed", "pitch"}  (/myvoice, same in every server)
+# "guilds": guild_id -> {"voice", "gvoice"?}                    (/voice server default)
+# "voice" = female/male (also picks the free voice), "gvoice" = chosen Google Cloud voice
 # With MONGODB_URI (MongoDB Atlas free M0) the database is the real copy, so cloud
 # redeploys and moving between PC and cloud lose nothing. user_settings.json next to
 # bot.py is always kept too: the only store without a database, otherwise an offline
@@ -197,6 +198,9 @@ class TTSBot(discord.Client):
         self.gc_limit_logged = ""
         self._gc_task: Optional[asyncio.Task] = None        # saves the count to MongoDB
         self._gc_retry_task: Optional[asyncio.Task] = None  # re-reads the count after a failure
+        # Thai Chirp 3 HD voices Google really has: short name ("Puck") -> (full name, gender)
+        self.gc_voices: dict[str, tuple[str, str]] = {}
+        self._gc_voices_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self):
         port = os.getenv("PORT")   # set by Render and similar hosts
@@ -211,6 +215,8 @@ class TTSBot(discord.Client):
             self.gc_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=GCLOUD_TIMEOUT + 2))
             if not await self.load_gcloud_usage():
                 self._gc_retry_task = asyncio.create_task(self._retry_gcloud_usage())
+            if not await self.load_gcloud_voices():
+                self._gc_voices_task = asyncio.create_task(self._retry_gcloud_voices())
         else:
             print("Google Cloud TTS: off (GOOGLE_TTS_API_KEY is not set), using the free voices")
         await self.tree.sync()
@@ -325,6 +331,57 @@ class TTSBot(discord.Client):
             await asyncio.sleep(120)
             await self.load_gcloud_usage()
 
+    # ----- Google Cloud TTS voice list (listing voices is free, it is not synthesis) -----
+    async def load_gcloud_voices(self) -> bool:
+        try:
+            async with self.gc_session.get(GCLOUD_VOICES_URL, params={"languageCode": "th-TH"},
+                                           headers={"X-Goog-Api-Key": GCLOUD_KEY}) as r:
+                data = await r.json(content_type=None)
+                if r.status != 200:
+                    msg = (data.get("error") or {}).get("message", "") if isinstance(data, dict) else ""
+                    raise GCloudError(f"HTTP {r.status}: {msg[:200]}", r.status)
+        except Exception as e:
+            print(f"WARNING: could not list Google Cloud TTS voices ({type(e).__name__}: "
+                  f"{str(e)[:200]}); only female/male can be chosen for now")
+            return False
+        found: dict[str, tuple[str, str]] = {}
+        # only Chirp 3 HD: the quota guard is set for its free tier (1M characters/month)
+        for v in data.get("voices") or []:
+            name = v.get("name", "")
+            gender = {"FEMALE": "female", "MALE": "male"}.get(v.get("ssmlGender", ""))
+            if (gender and "th-TH" in (v.get("languageCodes") or [])
+                    and name.startswith(GCLOUD_VOICE_PREFIX)):
+                found[name[len(GCLOUD_VOICE_PREFIX):]] = (name, gender)
+        if not found:
+            print("WARNING: Google Cloud TTS lists no Thai Chirp 3 HD voices; "
+                  "only female/male can be chosen")
+            return True     # the answer is valid, retrying would not change it
+        self.gc_voices = dict(sorted(found.items()))
+        for gender in ("female", "male"):   # make sure the defaults really exist
+            if GCLOUD_VOICES[gender] not in {n for n, _ in found.values()}:
+                pick = next((n for n, g in self.gc_voices.values() if g == gender), None)
+                if pick:
+                    print(f"Google Cloud TTS: {GCLOUD_VOICES[gender]} does not exist, "
+                          f"using {pick} as the default {gender} voice")
+                    GCLOUD_VOICES[gender] = pick
+        counts = {g: sum(1 for _, x in found.values() if x == g) for g in ("female", "male")}
+        print(f"Google Cloud TTS: {len(found)} Thai voices "
+              f"({counts['female']} female, {counts['male']} male)")
+        return True
+
+    async def _retry_gcloud_voices(self):
+        while True:
+            await asyncio.sleep(120)
+            if await self.load_gcloud_voices():
+                return
+
+    def find_gcloud_voice(self, text: str) -> Optional[str]:
+        """Short voice name ("Puck") for what the member typed or picked, or None."""
+        t = text.strip().lower()
+        if t.startswith(GCLOUD_VOICE_PREFIX.lower()):
+            t = t[len(GCLOUD_VOICE_PREFIX):]
+        return next((short for short in self.gc_voices if short.lower() == t), None)
+
     def gcloud_reserve(self, n: int) -> bool:
         """Count n characters against this month's quota before calling Google Cloud.
         False = do not use it (no key, count unknown, over the limit, or cooling down)."""
@@ -399,20 +456,27 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def voice_params(guild_id: int, user_id: int | None) -> tuple[str, float, int]:
-    """(voice key, speed, pitch Hz) for this member: own /myvoice settings within
-    the limits, otherwise the server defaults."""
+def voice_params(guild_id: int, user_id: int | None) -> tuple[str, float, int, str]:
+    """(gender, speed, pitch Hz, Google Cloud voice name) for this member: own /myvoice
+    settings within the limits, otherwise the server defaults. The gender picks the free
+    voice when Google Cloud is not used (quota used up, error, no key)."""
     s = bot.user_settings.get(str(user_id), {}) if user_id else {}
-    gender = (s.get("voice") or bot.guild_settings.get(str(guild_id), {}).get("voice")
-              or DEFAULT_VOICE)
-    if gender not in VOICES:
-        gender = "female"
+    g = bot.guild_settings.get(str(guild_id), {})
+    source = s if s.get("voice") else g if g.get("voice") else {"voice": DEFAULT_VOICE}
+    gender = source["voice"] if source["voice"] in VOICES else "female"
+    gname = GCLOUD_VOICES[gender]
+    chosen = source.get("gvoice")
+    if chosen and chosen.startswith(GCLOUD_VOICE_PREFIX):
+        known = bot.gc_voices.get(chosen[len(GCLOUD_VOICE_PREFIX):])
+        # use the chosen voice unless Google's list says it no longer exists
+        if known or not bot.gc_voices:
+            gname = chosen
     try:
         speed = _clamp(float(s["speed"]), SPEED_MIN, SPEED_MAX) if "speed" in s else DEFAULT_SPEED
         pitch = _clamp(int(s["pitch"]), PITCH_MIN, PITCH_MAX) if "pitch" in s else DEFAULT_PITCH
     except (TypeError, ValueError):
         speed, pitch = DEFAULT_SPEED, DEFAULT_PITCH
-    return gender, speed, pitch
+    return gender, speed, pitch, gname
 
 
 def speed_pitch_filter(speed: float, pitch_hz: int, male: bool = False) -> str:
@@ -451,6 +515,8 @@ _edge_fails = 0
 # voices (Microsoft Edge -> Google Translate) once GOOGLE_TTS_MONTHLY_LIMIT is reached.
 GCLOUD_KEY = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
 GCLOUD_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+GCLOUD_VOICES_URL = "https://texttospeech.googleapis.com/v1/voices"
+GCLOUD_VOICE_PREFIX = "th-TH-Chirp3-HD-"
 GCLOUD_VOICES = {
     "female": os.getenv("GOOGLE_TTS_FEMALE", "").strip() or "th-TH-Chirp3-HD-Kore",
     "male": os.getenv("GOOGLE_TTS_MALE", "").strip() or "th-TH-Chirp3-HD-Charon",
@@ -473,10 +539,10 @@ class GCloudError(Exception):
         self.status = status
 
 
-async def _gcloud(text: str, gender: str) -> str:
+async def _gcloud(text: str, voice_name: str) -> str:
     body = {
         "input": {"text": text},
-        "voice": {"languageCode": "th-TH", "name": GCLOUD_VOICES[gender]},
+        "voice": {"languageCode": "th-TH", "name": voice_name},
         "audioConfig": {"audioEncoding": "MP3"},
     }
     # key in a header, not the URL, so it can never show up in an error message
@@ -535,7 +601,7 @@ def _safe_remove(path):
 async def synthesise(text: str, guild_id: int, user_id: int | None = None) -> tuple[str, str, str]:
     """Returns (mp3 path, extra ffmpeg options, engine label for the log)."""
     global _edge_disabled_until, _edge_fails
-    gender, speed, pitch = voice_params(guild_id, user_id)
+    gender, speed, pitch, gname = voice_params(guild_id, user_id)
     voice = VOICES[gender]
     fallback_filter = speed_pitch_filter(speed, pitch, male=(gender == "male"))
     google_label = "google-translate (male, imitated)" if gender == "male" else "google-translate (female)"
@@ -543,9 +609,10 @@ async def synthesise(text: str, guild_id: int, user_id: int | None = None) -> tu
     # 1) Google Cloud TTS, only while this month's free quota lasts
     if bot.gcloud_reserve(len(text)):
         try:
-            path = await asyncio.wait_for(_gcloud(text, gender), timeout=GCLOUD_TIMEOUT)
+            path = await asyncio.wait_for(_gcloud(text, gname), timeout=GCLOUD_TIMEOUT)
             # real male and female voices: ffmpeg only applies speed and pitch
-            return path, speed_pitch_filter(speed, pitch), f"google-cloud ({gender})"
+            short = gname.removeprefix(GCLOUD_VOICE_PREFIX)
+            return path, speed_pitch_filter(speed, pitch), f"google-cloud ({short}, {gender})"
         except Exception as e:
             if isinstance(e, GCloudError) and e.status == 400:   # this text only (e.g. nothing speakable)
                 print(f"  Google Cloud TTS rejected this message ({e}); free voice for it")
@@ -752,44 +819,88 @@ async def skip(interaction: discord.Interaction):
     await interaction.response.send_message("⏭️ ข้ามแล้ว", ephemeral=True)
 
 
-@bot.tree.command(name="voice", description="เลือกเสียงผู้หญิงหรือผู้ชาย")
-@app_commands.choices(gender=[
-    app_commands.Choice(name="ผู้หญิง", value="female"),
-    app_commands.Choice(name="ผู้ชาย", value="male"),
-])
-async def voice(interaction: discord.Interaction, gender: app_commands.Choice[str]):
-    bot.set_setting("guilds", str(interaction.guild.id), {"voice": gender.value})
-    await interaction.response.send_message(
-        f"เปลี่ยนเสียงเริ่มต้นของเซิร์ฟเวอร์เป็นเสียง{gender.name}แล้ว "
-        f"(คนที่ตั้ง /myvoice ไว้จะใช้เสียงของตัวเอง)")
-
-
 VOICE_NAMES = {"female": "ผู้หญิง", "male": "ผู้ชาย"}
 
 
+def parse_voice(text: str) -> Optional[dict]:
+    """What a member picked or typed -> {"voice": gender[, "gvoice": full name]}, or None."""
+    t = text.strip()
+    for gender, thai in VOICE_NAMES.items():
+        if t.lower() == gender or t == thai:
+            return {"voice": gender}         # default Google voice of that gender
+    short = bot.find_gcloud_voice(t)
+    if short:
+        full, gender = bot.gc_voices[short]
+        return {"voice": gender, "gvoice": full}
+    return None
+
+
+async def voice_autocomplete(interaction: discord.Interaction, current: str):
+    options = [app_commands.Choice(name=f"{thai} (เสียงเริ่มต้น)", value=g)
+               for g, thai in VOICE_NAMES.items()]
+    options += [app_commands.Choice(name=f"{short} · {VOICE_NAMES[g]} (Google)", value=short)
+                for short, (_, g) in bot.gc_voices.items()]
+    c = current.strip().lower()
+    if c:
+        options = [o for o in options if c in o.name.lower() or c in o.value.lower()]
+    return options[:25]    # Discord shows at most 25
+
+
+VOICE_HELP = "พิมพ์ชื่อเพื่อค้นหา เช่น ผู้ชาย, ผู้หญิง, Puck"
+BAD_VOICE = "❌ ไม่รู้จักเสียงนี้ เลือกจากรายการที่ขึ้นมาตอนพิมพ์นะ"
+
+
+def describe_voice(gender: str, gname: str) -> str:
+    if GCLOUD_KEY:
+        short = gname.removeprefix(GCLOUD_VOICE_PREFIX)
+        return f"**{short}** ({VOICE_NAMES[gender]})"
+    return f"**{VOICE_NAMES[gender]}**"
+
+
+@bot.tree.command(name="voice", description="เลือกเสียงเริ่มต้นของเซิร์ฟเวอร์")
+@app_commands.describe(voice=VOICE_HELP)
+@app_commands.autocomplete(voice=voice_autocomplete)
+async def voice(interaction: discord.Interaction, voice: str):
+    doc = parse_voice(voice)
+    if doc is None:
+        return await interaction.response.send_message(BAD_VOICE, ephemeral=True)
+    bot.set_setting("guilds", str(interaction.guild.id), doc)
+    gender, _, _, gname = voice_params(interaction.guild.id, None)
+    await interaction.response.send_message(
+        f"เปลี่ยนเสียงเริ่มต้นของเซิร์ฟเวอร์เป็น {describe_voice(gender, gname)} แล้ว "
+        f"(คนที่ตั้ง /myvoice ไว้จะใช้เสียงของตัวเอง)")
+
+
 def describe_settings(guild_id: int, user_id: int) -> str:
-    gender, speed, pitch = voice_params(guild_id, user_id)
+    gender, speed, pitch, gname = voice_params(guild_id, user_id)
     own = bot.user_settings.get(str(user_id), {})
     tag = lambda key: "" if key in own else " (ค่าเริ่มต้น)"
-    return (f"🗣️ เสียง: **{VOICE_NAMES[gender]}**{tag('voice')}\n"
-            f"⏩ ความเร็ว: **{speed:g}x**{tag('speed')}\n"
-            f"🎵 ระดับเสียง: **{pitch:+d}**{tag('pitch')}\n"
-            f"-# ลิมิต: ความเร็ว {SPEED_MIN:g}–{SPEED_MAX:g}x · ระดับเสียง {PITCH_MIN:+d} ถึง {PITCH_MAX:+d}")
+    lines = [f"🗣️ เสียง: {describe_voice(gender, gname)}{tag('voice')}",
+             f"⏩ ความเร็ว: **{speed:g}x**{tag('speed')}",
+             f"🎵 ระดับเสียง: **{pitch:+d}**{tag('pitch')}"]
+    if GCLOUD_KEY:
+        if bot.gc_used is None:
+            quota = "ยังเช็กโควตาไม่ได้ ตอนนี้ใช้เสียงฟรี"
+        elif bot.gc_used >= GCLOUD_MONTHLY_LIMIT or bot.gc_limit_logged == _billing_month():
+            quota = "โควตาเดือนนี้หมดแล้ว ตอนนี้ใช้เสียงฟรี"
+        else:
+            quota = f"เหลือ {GCLOUD_MONTHLY_LIMIT - bot.gc_used:,} ตัวอักษรเดือนนี้"
+        lines.append(f"-# Google Cloud: {quota} · ถ้าหมด จะใช้เสียง{VOICE_NAMES[gender]}ฟรีแทน")
+    lines.append(f"-# ลิมิต: ความเร็ว {SPEED_MIN:g}–{SPEED_MAX:g}x · "
+                 f"ระดับเสียง {PITCH_MIN:+d} ถึง {PITCH_MAX:+d}")
+    return "\n".join(lines)
 
 
 @bot.tree.command(name="myvoice", description="ตั้งเสียง ความเร็ว และระดับเสียงที่บอทใช้อ่านข้อความของคุณ")
 @app_commands.describe(
-    voice="เสียงผู้หญิงหรือผู้ชาย",
+    voice=VOICE_HELP,
     speed=f"ความเร็ว {SPEED_MIN:g}–{SPEED_MAX:g} เท่า (เช่น 1.5)",
     pitch=f"ระดับเสียง {PITCH_MIN:+d} ถึง {PITCH_MAX:+d} (0 = ปกติ, มาก = เสียงสูง)",
 )
-@app_commands.choices(voice=[
-    app_commands.Choice(name="ผู้หญิง", value="female"),
-    app_commands.Choice(name="ผู้ชาย", value="male"),
-])
+@app_commands.autocomplete(voice=voice_autocomplete)
 async def myvoice(
     interaction: discord.Interaction,
-    voice: Optional[app_commands.Choice[str]] = None,
+    voice: Optional[str] = None,
     speed: Optional[app_commands.Range[float, SPEED_MIN, SPEED_MAX]] = None,
     pitch: Optional[app_commands.Range[int, PITCH_MIN, PITCH_MAX]] = None,
 ):
@@ -799,7 +910,11 @@ async def myvoice(
             describe_settings(interaction.guild_id, interaction.user.id), ephemeral=True)
     s = dict(bot.user_settings.get(key, {}))   # copy: the saver compares old vs new
     if voice is not None:
-        s["voice"] = voice.value
+        doc = parse_voice(voice)
+        if doc is None:
+            return await interaction.response.send_message(BAD_VOICE, ephemeral=True)
+        s.pop("gvoice", None)
+        s.update(doc)
     if speed is not None:
         s["speed"] = round(_clamp(speed, SPEED_MIN, SPEED_MAX), 2)
     if pitch is not None:

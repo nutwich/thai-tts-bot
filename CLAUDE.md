@@ -67,8 +67,8 @@ PORT=                   # set by Render: starts an aiohttp /health endpoint for 
   - `/leave` — disconnects and unbinds.
   - `/say text` — speaks arbitrary text.
   - `/skip` — stops the current clip.
-  - `/voice female|male` — switches the **server default** voice.
-  - `/myvoice [voice] [speed] [pitch]` — each member sets their own voice, speed (x) and pitch (Hz) for their messages and `/say`. Discord enforces the limits (`app_commands.Range` from `SPEED_MIN/MAX`, `PITCH_MIN/MAX`), and stored values are clamped again when they are used. Options left out are kept. With no options it shows the current settings (ephemeral).
+  - `/voice <voice>` — switches the **server default** voice. Autocomplete offers ผู้หญิง/ผู้ชาย (the default voice of that gender) plus every Thai Chirp 3 HD voice Google lists (e.g. `Puck · ผู้ชาย (Google)`). Typed values that match nothing are rejected.
+  - `/myvoice [voice] [speed] [pitch]` — each member sets their own voice (same autocomplete as `/voice`), speed (x) and pitch (Hz) for their messages and `/say`. Discord enforces the limits (`app_commands.Range` from `SPEED_MIN/MAX`, `PITCH_MIN/MAX`), and stored values are clamped again when they are used. Options left out are kept. With no options it shows the current settings (ephemeral).
   - `/resetvoice` — removes that member's own settings (back to the server defaults).
 - **Settings storage.** The owner does not want settings lost, and the bot is in several servers. Render wipes its disk on redeploy.
   - Two kinds of data:
@@ -86,7 +86,8 @@ PORT=                   # set by Render: starts an aiohttp /health endpoint for 
   - Error text goes through `_safe_err()`, so the URI (which contains the password) is never logged.
   - On Render without `MONGODB_URI`, a warning is logged.
   - `SSL handshake failed ... TLSV1_ALERT_INTERNAL_ERROR` from `*.mongodb.net` means Atlas **Network Access** does not allow the caller's IP. Render IPs change, so the fix is to allow `0.0.0.0/0`. Seen on Render on 27 Nov 2026.
-- `voice_params()` resolves voice/speed/pitch per message: member setting → server `/voice` → `.env` defaults. edge-tts gets `rate=f"{(speed-1)*100:+d}%"`, `pitch=f"{pitch:+d}Hz"`; the gTTS fallback uses `speed_pitch_filter(speed, pitch)` (pitch ratio `1 + Hz/250`, so +15 Hz ≈ 6%; atempo is chained to stay within 0.5–2.0).
+- **Voice choice.** A stored setting is `{"voice": female|male, "gvoice"?: "th-TH-Chirp3-HD-<Name>"}`. `gvoice` is used while Google Cloud is used; `voice` (the gender Google reports for that voice) picks the free voice when the quota is used up or Google Cloud fails. At start `load_gcloud_voices()` lists `GET /v1/voices?languageCode=th-TH` (free, not synthesis), keeps only `th-TH-Chirp3-HD-*` (the quota guard is set for that tier), retries every 2 min on failure, and replaces a `GOOGLE_TTS_FEMALE/MALE` default that does not exist with the first voice of that gender. A stored `gvoice` that Google no longer lists falls back to the gender default.
+- `voice_params()` resolves voice/speed/pitch per message: member setting → server `/voice` → `.env` defaults. It returns `(gender, speed, pitch, gcloud voice name)`; the voice fields come from the same layer (member if they chose a voice, else server). edge-tts gets `rate=f"{(speed-1)*100:+d}%"`, `pitch=f"{pitch:+d}Hz"`; the gTTS fallback uses `speed_pitch_filter(speed, pitch)` (pitch ratio `1 + Hz/250`, so +15 Hz ≈ 6%; atempo is chained to stay within 0.5–2.0).
 - `on_message`: reads only non-bot messages in the bound channel, and only while the bot is connected to voice.
 - Text cleaning before synthesis:
   - `clean_content` (mentions become names)
@@ -115,7 +116,7 @@ PORT=                   # set by Render: starts an aiohttp /health endpoint for 
 2. **edge-tts** with native `rate`/`pitch`, raced against gTTS. Microsoft wins if it answers within `EDGE_TIMEOUT`.
 3. **gTTS**, with speed and pitch applied by ffmpeg. The male voice is imitated with a lower pitch.
 
-Log labels: `google-cloud (male)`, `microsoft (female)`, `google-translate (male, imitated)`.
+Log labels: `google-cloud (Puck, male)`, `microsoft (female)`, `google-translate (male, imitated)`.
 
 **Google Cloud free-quota guard** (Chirp 3 HD: 1,000,000 characters free per month, then about $30 per 1M; Google bills automatically):
 - `gcloud_reserve()` counts `len(text)` **before** each request.
